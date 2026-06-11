@@ -79,20 +79,18 @@
 //!   * [`wasmer-compiler-llvm`](https://docs.rs/wasmer-compiler-llvm/) provides a deeply optimized executable
 //!     code with the fastest runtime speed, ideal for production.
 //!
-//! * **Interpreters** - Wasmer supports interpeters such as [`wamr`] and [`wasmi`].
-//!
 //! * **Other runtimes** - Wasmer supports [`v8`].
 //!
 //! * **Headless mode** — Once a WebAssembly module has been compiled, it
 //!   is possible to serialize it in a file for example, and later execute
 //!   it with Wasmer with headless mode turned on. Headless Wasmer has no
 //!   compiler, which makes it more portable and faster to load. It's
-//!   ideal for constrainted environments.
+//!   ideal for constrained environments.
 //!
 //! * **Cross-compilation** — Most compilers support cross-compilation. It
-//!   means it possible to pre-compile a WebAssembly module targetting a
+//!   means it possible to pre-compile a WebAssembly module targeting a
 //!   different architecture or platform and serialize it, to then run it
-//!   on the targetted architecture and platform later.
+//!   on the targeted architecture and platform later.
 //!
 //! * **Run Wasmer in a JavaScript environment** — With the `js` Cargo
 //!   feature, it is possible to compile a Rust program using Wasmer to
@@ -270,13 +268,7 @@
 //!   where `wasmer` will be compiled to a native executable
 //!   where the `v8` runtime is used for execution.
 //!
-//! 3. `wamr`
-#![cfg_attr(feature = "wamr", doc = "(enabled),")]
-#![cfg_attr(not(feature = "wamr"), doc = "(disabled),")]
-//!   where `wasmer` will be compiled to a native executable
-//!   where `wamr` (in interpreter mode) is used for execution.
-//!
-//! 4. `js`
+//! 3. `js`
 #![cfg_attr(feature = "js", doc = "(enabled),")]
 #![cfg_attr(not(feature = "js"), doc = "(disabled),")]
 //!    where `wasmer` will be compiled to WebAssembly to run in a
@@ -320,8 +312,8 @@
 #![cfg_attr(not(feature = "compiler"), doc = "(disabled),")]
 //!   enables compilation with the wasmer engine.
 //!
-//! Notice that the `sys`, `wamr` and `v8` features are composable together,
-//! so a single build of Wasmer using `llvm`, `cranelift`, `singlepass`, `wamr`, and `v8`
+//! Notice that the `sys` and `v8` features are composable together,
+//! so a single build of Wasmer using `llvm`, `cranelift`, `singlepass`, and `v8`
 //! (or any combination of them) is possible.
 //!
 #![cfg_attr(
@@ -357,7 +349,7 @@
 //! # Using Wasmer in a JavaScript environment
 //!
 //! Imagine a Rust program that uses this `wasmer` crate to execute a
-//! WebAssembly module. It is possible to compile this Rust progam to
+//! WebAssembly module. It is possible to compile this Rust program to
 //! WebAssembly by turning on the `js` Cargo feature of this `wasmer`
 //! crate.
 //!
@@ -409,41 +401,77 @@
 //! [`wasm-pack`]: https://github.com/rustwasm/wasm-pack/
 //! [`wasm-bindgen`]: https://github.com/rustwasm/wasm-bindgen
 //! [`v8`]: https://v8.dev/
-//! [`wamr`]: https://github.com/bytecodealliance/wasm-micro-runtime
-//! [`wasmi`]: https://github.com/wasmi-labs/wasmi
+
+macro_rules! cfg_compiler {
+    ($($item:item)*) => {
+        $(
+            #[cfg(any(
+                feature = "cranelift",
+                feature = "singlepass",
+                feature = "llvm",
+                feature = "js",
+                feature = "v8",
+                feature = "headless"
+            ))]
+            $item
+        )*
+    };
+}
 
 #[cfg(not(any(
-    feature = "sys",
-    feature = "js",
-    feature = "jsc",
-    feature = "wamr",
+    feature = "singlepass",
+    feature = "cranelift",
+    feature = "llvm",
     feature = "v8",
-    feature = "wasmi"
+    feature = "js",
+    feature = "headless",
 )))]
 compile_error!(
-    "One of: `sys`, `js`, `jsc` `wamr`, `wasmi` or `v8` features must be enabled. Please, pick one."
+    "wasmer requires enabling at least one backend feature: `singlepass`, `cranelift`, `llvm`, `v8`, `js` or `headless`."
 );
 
-mod utils;
-pub use utils::*;
+#[cfg(all(
+    feature = "sys",
+    not(any(
+        feature = "singlepass",
+        feature = "cranelift",
+        feature = "llvm",
+        feature = "headless"
+    ))
+))]
+compile_error!(
+    "the `sys` feature requires enabling at least one compiler backend: `singlepass`, `cranelift`, `llvm`, or `headless`."
+);
 
+cfg_compiler! {
+    mod utils;
+    pub use utils::*;
+    pub use entities::memory::{MemoryView, location::MemoryLocation};
+    mod error;
+    pub use error::*;
+    pub use entities::*;
+    mod backend;
+    pub use backend::*;
+    mod vm;
+}
+
+// TODO: cannot be placed into cfg_compiler due to: error: `inner` is ambiguous
+#[cfg(any(
+    feature = "cranelift",
+    feature = "singlepass",
+    feature = "llvm",
+    feature = "js",
+    feature = "v8",
+    feature = "headless",
+))]
 mod entities;
-pub use entities::memory::{MemoryView, location::MemoryLocation};
-pub use entities::*;
-
-mod error;
-pub use error::*;
-
-mod backend;
-pub use backend::*;
-mod vm;
 
 pub use wasmer_types::{
     Bytes, CompileError, DeserializeError, ExportIndex, ExportType, ExternType, FrameInfo,
     FunctionType, GlobalInit, GlobalType, ImportType, LocalFunctionIndex, MemoryError, MemoryStyle,
-    MemoryType, Mutability, OnCalledAction, Pages, ParseCpuFeatureError, SerializeError,
-    TableStyle, TableType, TagKind, TagType, Type, ValueType, WASM_MAX_PAGES, WASM_MIN_PAGES,
-    WASM_PAGE_SIZE, WasmError, WasmResult, is_wasm,
+    MemoryType, ModuleInfo, Mutability, OnCalledAction, Pages, ParseCpuFeatureError,
+    SerializeError, TableStyle, TableType, TagKind, TagType, Type, ValueType, WASM_MAX_PAGES,
+    WASM_MIN_PAGES, WASM_PAGE_SIZE, WasmError, WasmResult, is_wasm,
 };
 
 #[cfg(feature = "wasmparser")]
@@ -457,63 +485,15 @@ pub use wasmer_derive::ValueType;
 #[cfg(any(
     all(
         feature = "sys-default",
-        any(
-            feature = "js-default",
-            feature = "jsc-default",
-            feature = "wamr-default",
-            feature = "v8-default",
-            feature = "wasmi-default"
-        )
+        any(feature = "js-default", feature = "v8-default")
     ),
     all(
         feature = "js-default",
-        any(
-            feature = "sys-default",
-            feature = "jsc-default",
-            feature = "wamr-default",
-            feature = "v8-default",
-            feature = "wasmi-default"
-        )
-    ),
-    all(
-        feature = "jsc-default",
-        any(
-            feature = "sys-default",
-            feature = "js-default",
-            feature = "wamr-default",
-            feature = "v8-default",
-            feature = "wasmi-default"
-        )
-    ),
-    all(
-        feature = "wamr-default",
-        any(
-            feature = "sys-default",
-            feature = "js-default",
-            feature = "jsc-default",
-            feature = "v8-default",
-            feature = "wasmi-default"
-        )
+        any(feature = "sys-default", feature = "v8-default")
     ),
     all(
         feature = "v8-default",
-        any(
-            feature = "sys-default",
-            feature = "js-default",
-            feature = "jsc-default",
-            feature = "wasmi-default",
-            feature = "wasmi-default"
-        )
+        any(feature = "sys-default", feature = "js-default")
     ),
-    all(
-        feature = "wasmi-default",
-        any(
-            feature = "sys-default",
-            feature = "js-default",
-            feature = "jsc-default",
-            feature = "v8-default",
-            feature = "wamr-default"
-        )
-    )
 ))]
 compile_error!("Multiple *-default features selected. Please, pick one only!");

@@ -5,16 +5,21 @@ use cranelift_codegen::{
     settings::{self, Configurable},
 };
 use std::{
+    collections::HashMap,
     fs::File,
     io::{self, Write},
     sync::Arc,
 };
 use std::{num::NonZero, path::PathBuf};
+use target_lexicon::OperatingSystem;
 use wasmer_compiler::{
     Compiler, CompilerConfig, Engine, EngineBuilder, ModuleMiddleware,
-    misc::{CompiledKind, function_kind_to_filename},
+    misc::{CompiledKind, function_kind_to_filename, save_assembly_to_file},
 };
-use wasmer_types::target::{Architecture, CpuFeature, Target};
+use wasmer_types::{
+    Features,
+    target::{Architecture, CpuFeature, Target},
+};
 
 /// Callbacks to the different Cranelift compilation phases.
 #[derive(Debug, Clone)]
@@ -30,9 +35,19 @@ impl CraneliftCallbacks {
         Ok(Self { debug_dir })
     }
 
-    /// Writes the pre-optimization intermediate representation to a debug file.
-    pub fn preopt_ir(&self, kind: &CompiledKind, mem_buffer: &[u8]) {
+    fn base_path(&self, module_hash: &Option<String>) -> PathBuf {
         let mut path = self.debug_dir.clone();
+        if let Some(hash) = module_hash {
+            path.push(hash);
+        }
+        std::fs::create_dir_all(&path)
+            .unwrap_or_else(|_| panic!("cannot create debug directory: {}", path.display()));
+        path
+    }
+
+    /// Writes the pre-optimization intermediate representation to a debug file.
+    pub fn preopt_ir(&self, kind: &CompiledKind, module_hash: &Option<String>, mem_buffer: &[u8]) {
+        let mut path = self.base_path(module_hash);
         path.push(function_kind_to_filename(kind, ".preopt.clif"));
         let mut file =
             File::create(path).expect("Error while creating debug file from Cranelift IR");
@@ -40,12 +55,30 @@ impl CraneliftCallbacks {
     }
 
     /// Writes the object file memory buffer to a debug file.
-    pub fn obj_memory_buffer(&self, kind: &CompiledKind, mem_buffer: &[u8]) {
-        let mut path = self.debug_dir.clone();
+    pub fn obj_memory_buffer(
+        &self,
+        kind: &CompiledKind,
+        module_hash: &Option<String>,
+        mem_buffer: &[u8],
+    ) {
+        let mut path = self.base_path(module_hash);
         path.push(function_kind_to_filename(kind, ".o"));
         let mut file =
             File::create(path).expect("Error while creating debug file from Cranelift object");
         file.write_all(mem_buffer).unwrap();
+    }
+
+    /// Writes the assembly memory buffer to a debug file.
+    pub fn asm_memory_buffer(
+        &self,
+        kind: &CompiledKind,
+        module_hash: &Option<String>,
+        arch: Architecture,
+        mem_buffer: &[u8],
+    ) -> Result<(), wasmer_types::CompileError> {
+        let mut path = self.base_path(module_hash);
+        path.push(function_kind_to_filename(kind, ".s"));
+        save_assembly_to_file(arch, path, mem_buffer, HashMap::<usize, String>::new())
     }
 }
 
@@ -73,6 +106,7 @@ pub enum CraneliftOptLevel {
 #[derive(Debug, Clone)]
 pub struct Cranelift {
     enable_nan_canonicalization: bool,
+    pub(crate) allow_experimental_unaligned_memory_accesses: bool,
     enable_verifier: bool,
     pub(crate) enable_perfmap: bool,
     enable_pic: bool,
@@ -90,6 +124,7 @@ impl Cranelift {
     pub fn new() -> Self {
         Self {
             enable_nan_canonicalization: false,
+            allow_experimental_unaligned_memory_accesses: false,
             enable_verifier: false,
             opt_level: CraneliftOptLevel::Speed,
             enable_pic: false,
@@ -106,6 +141,16 @@ impl Cranelift {
     /// deterministically across different architectures.
     pub fn canonicalize_nans(&mut self, enable: bool) -> &mut Self {
         self.enable_nan_canonicalization = enable;
+        self
+    }
+
+    /// Enable run-time handling of potentially unaligned memory accesses.
+    /// Unaligned memory accesses occur when you try to read N bytes of data starting
+    /// from an address that is not evenly divisible by N.
+    ///
+    /// This feature is experimental and currently supports only scalar types.
+    pub fn allow_experimental_unaligned_memory_accesses(&mut self, enable: bool) -> &mut Self {
+        self.allow_experimental_unaligned_memory_accesses = enable;
         self
     }
 
@@ -194,7 +239,6 @@ impl Cranelift {
             flags.enable("is_pic").expect("should be a valid flag");
         }
 
-        // We set up libcall trampolines in engine-universal.
         // These trampolines are always reachable through short jumps.
         flags
             .enable("use_colocated_libcalls")
@@ -207,13 +251,8 @@ impl Cranelift {
             .expect("should be a valid flag");
 
         // Invert cranelift's default-on verification to instead default off.
-        let enable_verifier = if self.enable_verifier {
-            "true"
-        } else {
-            "false"
-        };
         flags
-            .set("enable_verifier", enable_verifier)
+            .set("enable_verifier", &self.enable_verifier.to_string())
             .expect("should be valid flag");
 
         flags
@@ -227,13 +266,11 @@ impl Cranelift {
             )
             .expect("should be valid flag");
 
-        let enable_nan_canonicalization = if self.enable_nan_canonicalization {
-            "true"
-        } else {
-            "false"
-        };
         flags
-            .set("enable_nan_canonicalization", enable_nan_canonicalization)
+            .set(
+                "enable_nan_canonicalization",
+                &self.enable_nan_canonicalization.to_string(),
+            )
             .expect("should be valid flag");
 
         settings::Flags::new(flags)
@@ -260,6 +297,10 @@ impl CompilerConfig for Cranelift {
         self.enable_perfmap = true;
     }
 
+    fn enable_experimental_unaligned_memory_accesses(&mut self) {
+        self.allow_experimental_unaligned_memory_accesses = true;
+    }
+
     fn canonicalize_nans(&mut self, enable: bool) {
         self.enable_nan_canonicalization = enable;
     }
@@ -272,6 +313,16 @@ impl CompilerConfig for Cranelift {
     /// Pushes a middleware onto the back of the middleware chain.
     fn push_middleware(&mut self, middleware: Arc<dyn ModuleMiddleware>) {
         self.middlewares.push(middleware);
+    }
+
+    fn supported_features_for_target(&self, target: &Target) -> wasmer_types::Features {
+        let mut feats = Features::default();
+        if target.triple().operating_system == OperatingSystem::Linux {
+            feats.exceptions(true);
+        }
+        feats.relaxed_simd(true);
+        feats.wide_arithmetic(true);
+        feats
     }
 }
 

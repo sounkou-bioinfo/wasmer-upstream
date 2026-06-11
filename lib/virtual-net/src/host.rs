@@ -4,7 +4,7 @@ use crate::ruleset::{Direction, Ruleset};
 use crate::{
     IpCidr, IpRoute, NetworkError, Result, SocketStatus, StreamSecurity, VirtualConnectedSocket,
     VirtualConnectionlessSocket, VirtualIcmpSocket, VirtualNetworking, VirtualRawSocket,
-    VirtualSocket, VirtualTcpListener, VirtualTcpSocket, VirtualUdpSocket,
+    VirtualSocket, VirtualTcpBoundSocket, VirtualTcpListener, VirtualTcpSocket, VirtualUdpSocket,
 };
 use crate::{VirtualIoSource, io_err_into_net_error};
 use bytes::{Buf, BytesMut};
@@ -19,7 +19,7 @@ use std::os::fd::RawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -28,6 +28,14 @@ use tracing::{debug, error, info, trace, warn};
 use virtual_mio::{
     HandlerGuardState, InterestGuard, InterestHandler, InterestType, Selector, state_as_waker_map,
 };
+
+/// Use the platform's maximum listen backlog where available so that
+/// `LocalTcpBoundSocket::listen` preserves the same accept capacity as
+/// the previous `std::net::TcpListener`-based implementation.
+#[cfg(all(target_family = "unix", feature = "libc"))]
+const LISTEN_BACKLOG: i32 = libc::SOMAXCONN;
+#[cfg(not(all(target_family = "unix", feature = "libc")))]
+const LISTEN_BACKLOG: i32 = 128;
 
 #[derive(Debug)]
 pub struct LocalNetworking {
@@ -66,6 +74,41 @@ impl Default for LocalNetworking {
     }
 }
 
+fn sock_addr_into_socket_addr(addr: socket2::SockAddr) -> Result<SocketAddr> {
+    addr.as_socket().ok_or(NetworkError::UnknownError)
+}
+
+fn tcp_socket_domain(addr: SocketAddr) -> socket2::Domain {
+    if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    }
+}
+
+#[allow(clippy::needless_bool)]
+fn tcp_connect_in_progress(err: &io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    ) {
+        true
+    } else {
+        #[cfg(all(target_family = "unix", feature = "libc"))]
+        {
+            matches!(
+                err.raw_os_error(),
+                Some(raw) if raw == libc::EINPROGRESS || raw == libc::EALREADY
+            )
+        }
+
+        #[cfg(not(all(target_family = "unix", feature = "libc")))]
+        {
+            false
+        }
+    }
+}
+
 #[async_trait::async_trait]
 #[allow(unused_variables)]
 impl VirtualNetworking for LocalNetworking {
@@ -83,21 +126,47 @@ impl VirtualNetworking for LocalNetworking {
             return Err(NetworkError::PermissionDenied);
         }
 
-        let listener = std::net::TcpListener::bind(addr)
-            .map(|sock| {
-                sock.set_nonblocking(true).ok();
-                Box::new(LocalTcpListener {
-                    stream: mio::net::TcpListener::from_std(sock),
-                    selector: self.selector.clone(),
-                    handler_guard: HandlerGuardState::None,
-                    no_delay: None,
-                    keep_alive: None,
-                    backlog: Default::default(),
-                    ruleset: self.ruleset.clone(),
-                })
-            })
+        self.bind_tcp(addr, only_v6, reuse_port, reuse_addr)
+            .await?
+            .listen()
+    }
+
+    async fn bind_tcp(
+        &self,
+        addr: SocketAddr,
+        only_v6: bool,
+        reuse_port: bool,
+        reuse_addr: bool,
+    ) -> Result<Box<dyn VirtualTcpBoundSocket + Sync>> {
+        if let Some(ruleset) = self.ruleset.as_ref()
+            && !ruleset.allows_socket(addr, Direction::Inbound)
+        {
+            tracing::warn!(%addr, "bind_tcp blocked by firewall rule");
+            return Err(NetworkError::PermissionDenied);
+        }
+
+        let socket = socket2::Socket::new(tcp_socket_domain(addr), socket2::Type::STREAM, None)
             .map_err(io_err_into_net_error)?;
-        Ok(listener)
+        socket
+            .set_nonblocking(true)
+            .map_err(io_err_into_net_error)?;
+        if addr.is_ipv6() {
+            socket.set_only_v6(only_v6).map_err(io_err_into_net_error)?;
+        }
+        socket
+            .set_reuse_address(reuse_addr)
+            .map_err(io_err_into_net_error)?;
+        #[cfg(not(windows))]
+        socket
+            .set_reuse_port(reuse_port)
+            .map_err(io_err_into_net_error)?;
+        socket.bind(&addr.into()).map_err(io_err_into_net_error)?;
+
+        Ok(Box::new(LocalTcpBoundSocket {
+            socket: Some(socket),
+            selector: self.selector.clone(),
+            ruleset: self.ruleset.clone(),
+        }))
     }
 
     async fn bind_udp(
@@ -378,6 +447,89 @@ impl VirtualIoSource for LocalTcpListener {
 }
 
 #[derive(Debug)]
+pub struct LocalTcpBoundSocket {
+    socket: Option<socket2::Socket>,
+    selector: Arc<Selector>,
+    ruleset: Option<Ruleset>,
+}
+
+impl VirtualTcpBoundSocket for LocalTcpBoundSocket {
+    fn addr_local(&self) -> Result<SocketAddr> {
+        let socket = self.socket.as_ref().ok_or(NetworkError::InvalidFd)?;
+        let addr = socket.local_addr().map_err(io_err_into_net_error)?;
+        sock_addr_into_socket_addr(addr)
+    }
+
+    fn listen(&mut self) -> Result<Box<dyn VirtualTcpListener + Sync>> {
+        let socket = self.socket.take().ok_or(NetworkError::InvalidFd)?;
+        socket
+            .listen(LISTEN_BACKLOG)
+            .map_err(io_err_into_net_error)?;
+        let listener = mio::net::TcpListener::from_std(socket.into());
+        Ok(Box::new(LocalTcpListener {
+            stream: listener,
+            selector: self.selector.clone(),
+            handler_guard: HandlerGuardState::None,
+            no_delay: None,
+            keep_alive: None,
+            backlog: Default::default(),
+            ruleset: self.ruleset.clone(),
+        }))
+    }
+
+    fn connect(&mut self, mut peer: SocketAddr) -> Result<Box<dyn VirtualTcpSocket + Sync>> {
+        if let Some(ruleset) = self.ruleset.as_ref()
+            && !ruleset.allows_socket(peer, Direction::Outbound)
+        {
+            tracing::warn!(%peer, "bound connect_tcp blocked by firewall rule");
+            return Err(NetworkError::PermissionDenied);
+        }
+
+        let socket = self.socket.take().ok_or(NetworkError::InvalidFd)?;
+        if let Err(err) = socket.connect(&peer.into())
+            && !tcp_connect_in_progress(&err)
+        {
+            return Err(io_err_into_net_error(err));
+        }
+
+        let stream = mio::net::TcpStream::from_std(socket.into());
+        if let Ok(p) = stream.peer_addr() {
+            peer = p;
+        }
+        Ok(Box::new(LocalTcpStream::new(
+            self.selector.clone(),
+            stream,
+            peer,
+        )))
+    }
+
+    fn set_ttl(&mut self, ttl: u32) -> Result<()> {
+        let socket = self.socket.as_ref().ok_or(NetworkError::InvalidFd)?;
+        match self.addr_local()?.ip() {
+            IpAddr::V4(_) => socket.set_ttl_v4(ttl).map_err(io_err_into_net_error),
+            IpAddr::V6(_) => socket
+                .set_unicast_hops_v6(ttl)
+                .map_err(io_err_into_net_error),
+        }
+    }
+
+    fn ttl(&self) -> Result<u32> {
+        let socket = self.socket.as_ref().ok_or(NetworkError::InvalidFd)?;
+        match self.addr_local()?.ip() {
+            IpAddr::V4(_) => socket.ttl_v4().map_err(io_err_into_net_error),
+            IpAddr::V6(_) => socket.unicast_hops_v6().map_err(io_err_into_net_error),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ConnectState {
+    Unknown,
+    Opened,
+    Failed,
+}
+
+#[derive(Debug)]
 pub struct LocalTcpStream {
     stream: mio::net::TcpStream,
     addr: SocketAddr,
@@ -385,6 +537,7 @@ pub struct LocalTcpStream {
     selector: Arc<Selector>,
     handler_guard: HandlerGuardState,
     buffer: BytesMut,
+    connect_state: Mutex<ConnectState>,
 }
 
 impl LocalTcpStream {
@@ -397,6 +550,7 @@ impl LocalTcpStream {
             selector,
             handler_guard: HandlerGuardState::None,
             buffer: BytesMut::new(),
+            connect_state: Mutex::new(ConnectState::Unknown),
         };
 
         // In windows we can not poll the socket as it is not supported and hence
@@ -605,7 +759,41 @@ impl VirtualSocket for LocalTcpStream {
     }
 
     fn status(&self) -> Result<SocketStatus> {
-        Ok(SocketStatus::Opened)
+        // `take_error()` consumes the latched socket error, so once the
+        // connect resolves we cache the terminal state to keep status() stable.
+        let mut connect_state = self.connect_state.lock().unwrap();
+        match *connect_state {
+            ConnectState::Opened => return Ok(SocketStatus::Opened),
+            ConnectState::Failed => return Ok(SocketStatus::Failed),
+            ConnectState::Unknown => {}
+        }
+
+        if self
+            .with_sock_ref(|sockref| sockref.take_error())
+            .map_err(io_err_into_net_error)?
+            .is_some()
+        {
+            *connect_state = ConnectState::Failed;
+            return Ok(SocketStatus::Failed); // connect error on the socket
+        }
+        match self.stream.peer_addr() {
+            Ok(_) => {
+                *connect_state = ConnectState::Opened;
+                Ok(SocketStatus::Opened) // TCP handshake completed.
+            }
+            Err(err) => {
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotConnected | io::ErrorKind::WouldBlock
+                ) {
+                    Ok(SocketStatus::Opening) // The connect is still in progress
+                } else {
+                    // TODO: Store the concrete err so we can return it later on
+                    *connect_state = ConnectState::Failed;
+                    Ok(SocketStatus::Failed) // Any other error means the socket is unusable
+                }
+            }
+        }
     }
 
     fn set_handler(&mut self, mut handler: Box<dyn InterestHandler + Send + Sync>) -> Result<()> {

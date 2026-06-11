@@ -1,3 +1,6 @@
+// Important note: make sure all enums are marked #[non_exhaustive] to force
+// Rust code to handle invalid values passed in from guests.
+
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 #[cfg(feature = "enable-serde")]
 use serde::{Deserialize, Serialize};
@@ -36,6 +39,7 @@ pub type Pid = u32;
 #[repr(u32)]
 #[derive(Clone, Copy, PartialEq, Eq, num_enum :: TryFromPrimitive, Hash)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub enum Snapshot0Clockid {
     #[doc = " The clock measuring real time. Time value zero corresponds with"]
     #[doc = " 1970-01-01T00:00:00Z."]
@@ -70,6 +74,7 @@ impl core::fmt::Debug for Snapshot0Clockid {
 #[doc = " Identifiers for clocks."]
 #[repr(u32)]
 #[derive(Clone, Copy, PartialEq, Eq, num_enum :: TryFromPrimitive, Hash)]
+#[non_exhaustive]
 pub enum Clockid {
     #[doc = " The clock measuring real time. Time value zero corresponds with"]
     #[doc = " 1970-01-01T00:00:00Z."]
@@ -104,6 +109,7 @@ impl core::fmt::Debug for Clockid {
 #[repr(u16)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, IntoPrimitive, TryFromPrimitive)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub enum Errno {
     #[doc = " No error occurred. System call completed successfully."]
     Success,
@@ -263,7 +269,7 @@ pub enum Errno {
     Shutdown,
     #[doc = " Memory access violation."]
     Memviolation,
-    #[doc = " An unknown error has occured"]
+    #[doc = " An unknown error has occurred"]
     Unknown,
 }
 impl Errno {
@@ -432,13 +438,13 @@ impl Errno {
             Errno::Notcapable => "Extension: Capabilities insufficient.",
             Errno::Shutdown => "Cannot send after socket shutdown.",
             Errno::Memviolation => "Memory access violation.",
-            Errno::Unknown => "An unknown error has occured",
+            Errno::Unknown => "An unknown error has occurred",
         }
     }
 }
 impl core::fmt::Debug for Errno {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "Errno::{}", &self.name())
+        write!(f, "Errno::{}", self.name())
     }
 }
 impl core::fmt::Display for Errno {
@@ -556,6 +562,7 @@ impl Rights {
 #[doc = " The type of a file descriptor or file."]
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Filetype {
     #[doc = " The type of the file descriptor or file is unknown or is different from any of the other types specified."]
     Unknown,
@@ -644,6 +651,7 @@ impl core::fmt::Debug for Dirent {
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub enum Advice {
     #[doc = " The application has no advice to give on its behavior with respect to the specified data."]
     Normal,
@@ -807,6 +815,7 @@ pub type Userdata = u64;
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub enum Eventtype {
     #[doc = " The time value of clock `subscription_clock::id` has"]
     #[doc = " reached timestamp `subscription_clock::timeout`."]
@@ -903,6 +912,7 @@ impl core::fmt::Debug for SubscriptionClock {
 #[doc = " Identifiers for preopened capabilities."]
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Preopentype {
     #[doc = " A pre-opened directory."]
     Dir,
@@ -975,6 +985,7 @@ impl core::fmt::Debug for SubscriptionFsReadwrite {
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub enum Socktype {
     Unknown,
     Stream,
@@ -985,7 +996,7 @@ pub enum Socktype {
 impl core::fmt::Debug for Socktype {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Socktype::Unknown => f.debug_tuple("Socktype::Uknown").finish(),
+            Socktype::Unknown => f.debug_tuple("Socktype::Unknown").finish(),
             Socktype::Stream => f.debug_tuple("Socktype::Stream").finish(),
             Socktype::Dgram => f.debug_tuple("Socktype::Dgram").finish(),
             Socktype::Raw => f.debug_tuple("Socktype::Raw").finish(),
@@ -995,6 +1006,7 @@ impl core::fmt::Debug for Socktype {
 }
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Sockstatus {
     Opening,
     Opened,
@@ -1016,6 +1028,7 @@ impl core::fmt::Debug for Sockstatus {
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub enum Sockoption {
     Noop,
     ReusePort,
@@ -1080,6 +1093,7 @@ impl core::fmt::Debug for Sockoption {
 }
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Streamsecurity {
     Unencrypted,
     AnyEncryption,
@@ -1107,6 +1121,7 @@ impl core::fmt::Debug for Streamsecurity {
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub enum Addressfamily {
     Unspec,
     Inet4,
@@ -1177,6 +1192,7 @@ impl core::fmt::Debug for Filestat {
 }
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Snapshot0Whence {
     Cur,
     End,
@@ -1196,6 +1212,7 @@ impl core::fmt::Debug for Snapshot0Whence {
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub enum Whence {
     Set,
     Cur,
@@ -1245,6 +1262,7 @@ impl core::fmt::Debug for Tty {
 #[doc = " __wasi_option_t"]
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OptionTag {
     None,
     Some,
@@ -1359,6 +1377,7 @@ impl core::fmt::Debug for PipeHandles {
 }
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StdioMode {
     Piped,
     Inherit,
@@ -1378,6 +1397,7 @@ impl core::fmt::Debug for StdioMode {
 #[repr(u16)]
 #[derive(Clone, Copy, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub enum SockProto {
     Ip,
     Icmp,
@@ -2220,6 +2240,7 @@ impl core::fmt::Debug for SockProto {
 }
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Bool {
     False,
     True,
@@ -2257,6 +2278,7 @@ impl core::fmt::Debug for OptionTimestamp {
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, num_enum :: TryFromPrimitive, Hash)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub enum Signal {
     Signone = 0,
     Sighup,
@@ -2335,6 +2357,7 @@ impl core::fmt::Debug for Signal {
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, num_enum :: TryFromPrimitive, Hash)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub enum Disposition {
     Default,
     Ignore,
@@ -2366,6 +2389,7 @@ impl core::fmt::Debug for SignalDisposition {
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, num_enum :: TryFromPrimitive, Hash)]
+#[non_exhaustive]
 pub enum ProcSpawnFdOpName {
     Close,
     Dup2,
@@ -2442,6 +2466,7 @@ impl DlFlags {
 #[doc = " For now only number types are supported, but this may be extended in the future to include references"]
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, num_enum :: TryFromPrimitive, Hash)]
+#[non_exhaustive]
 pub enum WasmValueType {
     #[doc = " A i32 parameter."]
     I32,
@@ -2594,6 +2619,7 @@ pub type SdFlags = u8;
 pub type SiFlags = u16;
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Timeout {
     Read,
     Write,
@@ -2628,9 +2654,10 @@ impl JoinFlags {
         Self { bits }
     }
 }
-#[doc = " What has happened with the proccess when we joined on it"]
+#[doc = " What has happened with the process when we joined on it"]
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum JoinStatusType {
     #[doc = " Nothing has happened"]
     Nothing,

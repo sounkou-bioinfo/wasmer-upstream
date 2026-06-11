@@ -1,5 +1,3 @@
-use std::f32::consts::E;
-
 use super::*;
 #[cfg(feature = "journal")]
 use crate::journal::JournalEffector;
@@ -10,6 +8,7 @@ use crate::{
         TaintReason,
         task_manager::{TaskWasm, TaskWasmRunProperties},
     },
+    state::context_switching::ContextSwitchingEnvironment,
     syscalls::*,
 };
 
@@ -164,8 +163,19 @@ pub fn thread_spawn_internal_using_layout<M: MemorySize>(
     }
     let thread_module = module_handles.module_clone();
     let spawn_type = match linker {
-        Some(linker) => crate::runtime::SpawnType::NewLinkerInstanceGroup(linker, func_env, store),
-        None => crate::runtime::SpawnType::ShareMemory(thread_memory, store.as_store_ref()),
+        Some(linker) => {
+            let instance_group_data = linker.prepare_for_instance_group(ctx).map_err(|e| {
+                tracing::warn!("failed to prepare linker for thread spawn: {e}");
+                Errno::Notcapable
+            })?;
+            crate::runtime::SpawnType::NewLinkerInstanceGroup(instance_group_data)
+        }
+        None => crate::runtime::SpawnType::AttachMemory(
+            thread_memory.as_shared(&store).ok_or_else(|| {
+                tracing::warn!("Memory must be shared for thread spawning to work");
+                Errno::Memviolation
+            })?,
+        ),
     };
 
     // Now spawn a thread
@@ -185,37 +195,42 @@ pub fn thread_spawn_internal_using_layout<M: MemorySize>(
 
 // This function calls into the module
 fn call_module_internal<M: MemorySize>(
-    env: &WasiFunctionEnv,
-    store: &mut Store,
+    ctx: &WasiFunctionEnv,
+    mut store: Store,
     start_ptr_offset: M::Offset,
-) -> Result<(), DeepSleepWork> {
-    // We either call the reactor callback or the thread spawn callback
-    //trace!("threading: invoking thread callback (reactor={})", reactor);
-
+) -> (Store, Result<Option<ExitCode>, DeepSleepWork>) {
     // Note: we ensure both unwraps can happen before getting to this point
-    let spawn = env
+    let spawn = ctx
         .data(&store)
         .inner()
         .main_module_instance_handles()
         .thread_spawn
         .clone()
         .unwrap();
-    let tid = env.data(&store).tid();
-    let thread_result = spawn.call(
+    let tid = ctx.data(&store).tid();
+
+    let spawn: Function = spawn.into();
+    let tid_i32 = tid.raw().try_into().map_err(|_| Errno::Overflow).unwrap();
+    let start_pointer_i32 = start_ptr_offset
+        .try_into()
+        .map_err(|_| Errno::Overflow)
+        .unwrap();
+    let (mut store, thread_result) = ContextSwitchingEnvironment::run_main_context(
+        ctx,
         store,
-        tid.raw().try_into().map_err(|_| Errno::Overflow).unwrap(),
-        start_ptr_offset
-            .try_into()
-            .map_err(|_| Errno::Overflow)
-            .unwrap(),
+        spawn,
+        vec![Value::I32(tid_i32), Value::I32(start_pointer_i32)],
     );
+    let thread_result = thread_result.map(|_| ());
+
     trace!("callback finished (ret={:?})", thread_result);
 
-    let exit_code = handle_thread_result(env, store, thread_result)?;
+    let exit_code = match handle_thread_result(ctx, &mut store, thread_result) {
+        Ok(code) => code,
+        Err(deep_sleep) => return (store, Err(deep_sleep)),
+    };
 
-    // Clean up the environment on exit
-    env.on_exit(store, exit_code);
-    Ok(())
+    (store, Ok(exit_code))
 }
 
 fn handle_thread_result(
@@ -265,7 +280,11 @@ fn handle_thread_result(
             Ok(Some(ExitCode::from(129)))
         }
         Err(err) => {
-            eprintln!("Thread {tid} of process {pid} failed with runtime error: {err}");
+            if err.clone().to_trap() == Some(wasmer_types::TrapCode::HostInterrupt) {
+                debug!(%tid, %pid, error = %err, "thread interrupted by host");
+            } else {
+                eprintln!("Thread {tid} of process {pid} failed with runtime error: {err}");
+            }
             env.data(&store)
                 .runtime
                 .on_taint(TaintReason::RuntimeError(err));
@@ -301,7 +320,7 @@ fn call_module<M: MemorySize>(
     }
 
     // Now invoke the module
-    let ret = call_module_internal::<M>(&ctx, &mut store, start_ptr_offset);
+    let (mut store, ret) = call_module_internal::<M>(&ctx, store, start_ptr_offset);
 
     // If it went to deep sleep then we need to handle that
     if let Err(deep) = ret {
@@ -327,6 +346,15 @@ fn call_module<M: MemorySize>(
         };
         return;
     };
-    // I don't think we need to do this explicitly, but it was done before refactoring so we keep it for now.
+
+    let exit_code = ret.unwrap_or_else(|_| unreachable!());
+    if let Some(exit_code) = exit_code {
+        ctx.on_exit(&mut store, Some(exit_code));
+        thread_handle.set_status_finished(Ok(exit_code));
+    } else {
+        ctx.on_exit(&mut store, None);
+        thread_handle.set_status_finished(Ok(Errno::Success.into()));
+    }
+
     drop(thread_handle);
 }

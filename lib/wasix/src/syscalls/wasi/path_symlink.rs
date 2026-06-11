@@ -67,33 +67,22 @@ pub fn path_symlink_internal(
         return Err(Errno::Access);
     }
 
-    // get the depth of the parent + 1 (UNDER INVESTIGATION HMMMMMMMM THINK FISH ^ THINK FISH)
-    let old_path_path = std::path::Path::new(old_path);
-    let (source_inode, _) = state
-        .fs
-        .get_parent_inode_at_path(inodes, fd, old_path_path, true)?;
-    let depth = state.fs.path_depth_from_fd(fd, source_inode);
-
-    // depth == -1 means folder is not relative. See issue #3233.
-    let depth = match depth {
-        Ok(depth) => depth as i32 - 1,
-        Err(_) => -1,
-    };
-
     let new_path_path = std::path::Path::new(new_path);
     let (target_parent_inode, entry_name) =
         state
             .fs
             .get_parent_inode_at_path(inodes, fd, new_path_path, true)?;
 
-    // short circuit if anything is wrong, before we create an inode
-    {
+    let symlink_path = {
         let guard = target_parent_inode.read();
         match guard.deref() {
-            Kind::Dir { entries, .. } => {
+            Kind::Dir { entries, path, .. } => {
                 if entries.contains_key(&entry_name) {
                     return Err(Errno::Exist);
                 }
+                crate::fs::PosixPath::from_path(path)
+                    .join(&crate::fs::PosixPath::new(&entry_name))
+                    .into_path_buf()
             }
             Kind::Root { .. } => return Err(Errno::Notcapable),
             Kind::Socket { .. }
@@ -106,19 +95,31 @@ pub fn path_symlink_internal(
                 unreachable!("get_parent_inode_at_path returned something other than a Dir or Root")
             }
         }
-    }
+    };
 
-    let mut source_path = std::path::Path::new(old_path);
-    let mut relative_path = std::path::PathBuf::new();
-    for _ in 0..depth {
-        relative_path.push("..");
-    }
-    relative_path.push(source_path);
+    // Guest-created symlinks live in the virtual filesystem namespace. Keep
+    // their location relative to the virtual root so targets like
+    // `/temp/link -> ../hamlet/file` can cross sibling preopens without
+    // escaping the guest sandbox.
+    let path_to_symlink = crate::fs::PosixPath::from_path(&symlink_path)
+        .strip_root_prefix()
+        .into_path_buf();
+    let relative_path = std::path::PathBuf::from(old_path);
+
+    let source_path = std::path::Path::new(old_path);
+    let target_path = symlink_path.as_path();
+    let persisted_in_backing_fs = state.fs.root_fs.create_symlink(source_path, target_path);
+
+    let needs_ephemeral_fallback = match persisted_in_backing_fs {
+        Ok(()) => false,
+        Err(virtual_fs::FsError::Unsupported) => true,
+        Err(err) => return Err(fs_error_into_wasi_err(err)),
+    };
 
     let kind = Kind::Symlink {
-        base_po_dir: fd,
-        path_to_symlink: std::path::PathBuf::from(new_path),
-        relative_path,
+        symlink_kind: crate::fs::SymlinkKind::Virtual,
+        path_to_symlink: path_to_symlink.clone(),
+        relative_path: relative_path.clone(),
     };
     let new_inode =
         state
@@ -130,6 +131,15 @@ pub fn path_symlink_internal(
         if let Kind::Dir { entries, .. } = guard.deref_mut() {
             entries.insert(entry_name, new_inode);
         }
+    }
+
+    // Keep transient map in sync with the backing outcome.
+    if needs_ephemeral_fallback {
+        state
+            .fs
+            .register_ephemeral_symlink(symlink_path, path_to_symlink, relative_path);
+    } else {
+        state.fs.unregister_ephemeral_symlink(target_path);
     }
 
     Ok(())

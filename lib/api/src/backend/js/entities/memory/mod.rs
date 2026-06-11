@@ -11,7 +11,7 @@ use wasm_bindgen::JsCast;
 use wasmer_types::{MemoryError, MemoryType, Pages, WASM_PAGE_SIZE};
 
 use crate::{
-    AsStoreMut, AsStoreRef, BackendMemory,
+    AsStoreMut, AsStoreRef, BackendMemory, SharedMemory,
     js::vm::memory::VMMemory,
     vm::{VMExtern, VMExternMemory},
 };
@@ -21,7 +21,7 @@ pub struct Memory {
     pub(crate) handle: VMMemory,
 }
 
-// Only SharedMemories can be Send in js, becuase they support `structuredClone`.
+// Only SharedMemories can be Send in js, because they support `structuredClone`.
 // Normal memories will fail while doing structuredClone.
 // In this case, we implement Send just in case as it can be a shared memory.
 // https://developer.mozilla.org/en-US/docs/Web/API/structuredClone
@@ -151,30 +151,28 @@ impl Memory {
 
     pub(crate) fn from_vm_extern(_store: &mut impl AsStoreMut, internal: VMExternMemory) -> Self {
         Self {
-            handle: internal.into_js(),
+            handle: internal.unwrap_js(),
         }
     }
 
-    /// Cloning memory will create another reference to the same memory that
-    /// can be put into a new store
-    pub fn try_clone(&self, _store: &impl AsStoreRef) -> Result<VMMemory, MemoryError> {
-        self.handle.try_clone()
-    }
-
-    /// Copying the memory will actually copy all the bytes in the memory to
-    /// a identical byte copy of the original that can be put into a new store
-    pub fn try_copy(&self, store: &impl AsStoreRef) -> Result<VMMemory, MemoryError> {
-        let mut cloned = self.try_clone(store)?;
-        cloned.copy()
+    pub fn copy(&self, _store: &impl AsStoreRef) -> Result<SharedMemory, MemoryError> {
+        Ok(SharedMemory::new(crate::vm::VMSharedMemory::Js(
+            self.handle.copy()?,
+        )))
     }
 
     pub fn is_from_store(&self, _store: &impl AsStoreRef) -> bool {
         true
     }
 
-    pub fn as_shared(&self, _store: &impl AsStoreRef) -> Option<crate::shared::SharedMemory> {
-        // Not supported.
-        None
+    pub fn as_shared(&self, store: &impl AsStoreRef) -> Result<SharedMemory, MemoryError> {
+        if !self.ty(store).shared {
+            return Err(MemoryError::MemoryNotShared);
+        }
+
+        Ok(SharedMemory::new(crate::vm::VMSharedMemory::Js(
+            self.handle.try_clone()?,
+        )))
     }
 }
 

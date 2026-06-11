@@ -1,5 +1,4 @@
 use std::{
-    fmt::Write as _,
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
@@ -276,12 +275,7 @@ fn sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::default();
     hasher.update(bytes);
     let hash = hasher.finalize();
-    let mut buffer = String::with_capacity(hash.len() * 2);
-    for byte in hash {
-        write!(buffer, "{byte:02X}").expect("Unreachable");
-    }
-
-    buffer
+    hex::encode_upper(hash)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -392,10 +386,14 @@ mod tests {
 
     use super::*;
 
-    const PYTHON: &[u8] = include_bytes!("../../../../c-api/examples/assets/python-0.1.0.wasmer");
-    const COREUTILS: &[u8] = include_bytes!(
-        "../../../../../tests/integration/cli/tests/webc/coreutils-1.0.16-e27dbb4f-2ef2-4b44-b46a-ddd86497c6d7.webc"
-    );
+    const PYTHON: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../wasmer-test-files/examples/python-0.1.0.wasmer"
+    ));
+    const COREUTILS: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../wasmer-test-files/integration/webc/coreutils-1.0.16-e27dbb4f-2ef2-4b44-b46a-ddd86497c6d7.webc"
+    ));
     const DUMMY_URL: &str = "http://my-registry.io/some/package";
     const DUMMY_URL_HASH: &str = "4D7481F44E1D971A8C60D3C7BD505E2727602CF9369ED623920E029C2BA2351D";
 

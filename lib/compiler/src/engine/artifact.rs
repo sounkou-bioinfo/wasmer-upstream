@@ -33,30 +33,29 @@ use crate::object::{
     Object, ObjectMetadataBuilder, emit_compilation, emit_data, get_object_for_target,
 };
 
-#[cfg(feature = "compiler")]
-use wasmer_types::HashAlgorithm;
 use wasmer_types::{
-    ArchivedDataInitializerLocation, ArchivedOwnedDataInitializer, CompileError, DataInitializer,
-    DataInitializerLike, DataInitializerLocation, DataInitializerLocationLike, DeserializeError,
-    FunctionIndex, LocalFunctionIndex, MemoryIndex, ModuleInfo, OwnedDataInitializer,
-    SerializeError, SignatureIndex, TableIndex,
+    ArchivedDataInitializerLocation, ArchivedOwnedDataInitializer, CompilationProgressCallback,
+    CompileError, DataInitializer, DataInitializerLike, DataInitializerLocation,
+    DataInitializerLocationLike, DeserializeError, FunctionIndex, LocalFunctionIndex, MemoryIndex,
+    ModuleInfo, OwnedDataInitializer, SerializeError, SignatureIndex, TableIndex,
     entity::{BoxedSlice, PrimaryMap},
     target::{CpuFeature, Target},
 };
 
+use wasmer_types::VMOffsets;
 use wasmer_vm::{
     FunctionBodyPtr, InstanceAllocator, MemoryStyle, StoreObjects, TableStyle, TrapHandlerFn,
-    VMConfig, VMExtern, VMInstance, VMSharedSignatureIndex, VMTrampoline,
+    VMConfig, VMExtern, VMInstance, VMSignatureHash, VMTrampoline,
 };
 
 #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 pub struct AllocatedArtifact {
-    // This shows if the frame info has been regestered already or not.
-    // Because the 'GlobalFrameInfoRegistration' ownership can be transfered to EngineInner
+    // This shows if the frame info has been registered already or not.
+    // Because the 'GlobalFrameInfoRegistration' ownership can be transferred to EngineInner
     // this bool is needed to track the status, as 'frame_info_registration' will be None
-    // after the ownership is transfered.
+    // after the ownership is transferred.
     frame_info_registered: bool,
-    // frame_info_registered is not staying there but transfered to CodeMemory from EngineInner
+    // frame_info_registered is not staying there but transferred to CodeMemory from EngineInner
     // using 'Artifact::take_frame_info_registration' method
     // so the GloabelFrameInfo and MMap stays in sync and get dropped at the same time
     frame_info_registration: Option<GlobalFrameInfoRegistration>,
@@ -65,8 +64,40 @@ pub struct AllocatedArtifact {
     #[cfg_attr(feature = "artifact-size", loupe(skip))]
     finished_function_call_trampolines: BoxedSlice<SignatureIndex, VMTrampoline>,
     finished_dynamic_function_trampolines: BoxedSlice<FunctionIndex, FunctionBodyPtr>,
-    signatures: BoxedSlice<SignatureIndex, VMSharedSignatureIndex>,
+    signatures: BoxedSlice<SignatureIndex, VMSignatureHash>,
     finished_function_lengths: BoxedSlice<LocalFunctionIndex, usize>,
+
+    /// Precomputed `VMOffsets` for this artifact's module, cloned by
+    /// `Artifact::instantiate` instead of recomputing on every call.
+    ///
+    /// Safe to cache because `VMOffsets::new(pointer_size, module_info)`
+    /// is deterministic, `module_info` is immutable after compile (the
+    /// only mutable field `name` is not a `VMOffsets` input), and the
+    /// host's pointer size is a runtime constant.
+    ///
+    /// Built once in `from_parts` and in the deserialization path
+    /// (`deserialize_object_native`); `VMOffsets::new` was ~9% of
+    /// `Instance::new` time on profile traces of a per-request wasm
+    /// host calling `Module::instantiate` in a tight loop.
+    #[cfg_attr(feature = "artifact-size", loupe(skip))]
+    vm_offsets: VMOffsets,
+}
+
+impl AllocatedArtifact {
+    fn function_extents(&self) -> PrimaryMap<LocalFunctionIndex, FunctionExtent> {
+        assert_eq!(
+            self.finished_functions.len(),
+            self.finished_function_lengths.len(),
+            "finished_functions and finished_function_lengths must have equal length"
+        );
+        self.finished_functions
+            .iter()
+            .map(|(index, &ptr)| {
+                let length = self.finished_function_lengths[index];
+                FunctionExtent { ptr, length }
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -80,7 +111,7 @@ pub struct ArtifactId {
 impl ArtifactId {
     /// Format this identifier as a string.
     pub fn id(&self) -> String {
-        format!("{}", &self.id)
+        format!("{}", self.id)
     }
 }
 
@@ -126,7 +157,7 @@ impl Artifact {
         engine: &Engine,
         data: &[u8],
         tunables: &dyn Tunables,
-        hash_algorithm: Option<HashAlgorithm>,
+        progress_callback: Option<CompilationProgressCallback>,
     ) -> Result<Self, CompileError> {
         let mut inner_engine = engine.inner_mut();
         let environ = ModuleEnvironment::new();
@@ -149,7 +180,7 @@ impl Artifact {
             engine.target(),
             memory_styles,
             table_styles,
-            hash_algorithm,
+            progress_callback.as_ref(),
         )?;
 
         Self::from_parts(
@@ -217,7 +248,7 @@ impl Artifact {
                     }
                     Err(e) => {
                         return Err(DeserializeError::Incompatible(format!(
-                            "The provided bytes are not wasmer-universal: {e}"
+                            "The provided bytes are not a Wasmer engine artifact: {e}"
                         )));
                     }
                 }
@@ -264,7 +295,7 @@ impl Artifact {
                     }
                     Err(e) => {
                         return Err(DeserializeError::Incompatible(format!(
-                            "The provided bytes are not wasmer-universal: {e}"
+                            "The provided bytes are not a Wasmer engine artifact: {e}"
                         )));
                     }
                 }
@@ -412,10 +443,12 @@ impl Artifact {
             module_info
                 .signatures
                 .values()
-                .map(|sig| signature_registry.register(sig))
+                .zip(module_info.signature_hashes.values())
+                .map(|(sig, sig_hash)| signature_registry.register(sig, *sig_hash))
                 .collect::<PrimaryMap<_, _>>()
         };
 
+        #[allow(unused_variables)]
         let eh_frame = match &artifact {
             ArtifactBuildVariant::Plain(p) => p.get_unwind_info().eh_frame.map(|v| unsafe {
                 std::slice::from_raw_parts(
@@ -430,7 +463,7 @@ impl Artifact {
                 )
             }),
         };
-
+        #[allow(unused_variables)]
         let compact_unwind = match &artifact {
             ArtifactBuildVariant::Plain(p) => p.get_unwind_info().compact_unwind.map(|v| unsafe {
                 std::slice::from_raw_parts(
@@ -448,13 +481,7 @@ impl Artifact {
             }
         };
 
-        // This needs to be called before publishing the `eh_frame`.
-        engine_inner.register_compact_unwind(
-            compact_unwind,
-            get_got_address(RelocationTarget::LibCall(wasmer_vm::LibCall::EHPersonality)),
-        )?;
-
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "compiler"))]
         {
             engine_inner.register_perfmap(&finished_functions, module_info)?;
         }
@@ -462,6 +489,17 @@ impl Artifact {
         // Make all code compiled thus far executable.
         engine_inner.publish_compiled_code();
 
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(compact_unwind) = compact_unwind {
+            engine_inner.publish_compact_unwind(
+                compact_unwind,
+                get_got_address(RelocationTarget::LibCall(wasmer_vm::LibCall::EHPersonality)),
+            )?;
+        }
+        #[cfg(not(any(
+            target_arch = "wasm32",
+            all(target_os = "macos", target_arch = "aarch64")
+        )))]
         engine_inner.publish_eh_frame(eh_frame)?;
 
         drop(get_got_address);
@@ -482,6 +520,8 @@ impl Artifact {
             finished_dynamic_function_trampolines.into_boxed_slice();
         let signatures = signatures.into_boxed_slice();
 
+        let vm_offsets = VMOffsets::new(std::mem::size_of::<usize>() as u8, module_info);
+
         let mut artifact = Self {
             id: Default::default(),
             artifact,
@@ -493,6 +533,7 @@ impl Artifact {
                 finished_dynamic_function_trampolines,
                 signatures,
                 finished_function_lengths,
+                vm_offsets,
             }),
         };
 
@@ -684,8 +725,7 @@ impl DataInitializerLocationVariant<'_> {
             Self::Plain(p) => (*p).clone(),
             Self::Archived(a) => DataInitializerLocation {
                 memory_index: a.memory_index(),
-                base: a.base(),
-                offset: a.offset(),
+                offset_expr: a.offset_expr(),
             },
         }
     }
@@ -699,17 +739,10 @@ impl DataInitializerLocationLike for DataInitializerLocationVariant<'_> {
         }
     }
 
-    fn base(&self) -> Option<wasmer_types::GlobalIndex> {
+    fn offset_expr(&self) -> wasmer_types::InitExpr {
         match self {
-            Self::Plain(plain) => plain.base(),
-            Self::Archived(archived) => archived.base(),
-        }
-    }
-
-    fn offset(&self) -> usize {
-        match self {
-            Self::Plain(plain) => plain.offset(),
-            Self::Archived(archived) => archived.offset(),
+            Self::Plain(plain) => plain.offset_expr(),
+            Self::Archived(archived) => archived.offset_expr(),
         }
     }
 }
@@ -729,19 +762,7 @@ impl Artifact {
             .allocated
             .as_ref()
             .expect("It must be allocated")
-            .finished_functions
-            .values()
-            .copied()
-            .zip(
-                self.allocated
-                    .as_ref()
-                    .expect("It must be allocated")
-                    .finished_function_lengths
-                    .values()
-                    .copied(),
-            )
-            .map(|(ptr, length)| FunctionExtent { ptr, length })
-            .collect::<PrimaryMap<LocalFunctionIndex, _>>()
+            .function_extents()
             .into_boxed_slice();
 
         let frame_info_registration = &mut self
@@ -789,6 +810,24 @@ impl Artifact {
             .finished_functions
     }
 
+    /// Returns the start address and byte length of each locally-defined
+    /// function body in this artifact.
+    ///
+    /// Returns `None` for cross-compiled artifacts (where the artifact has not
+    /// been allocated into the host process).
+    ///
+    /// # Security
+    ///
+    /// The returned addresses are host-process pointers. They are not stable
+    /// across runs and must not be forwarded to untrusted parties, as they
+    /// reveal ASLR layout information.
+    pub fn finished_function_extents(
+        &self,
+    ) -> Option<Vec<(LocalFunctionIndex, FunctionExtent)>> {
+        let allocated = self.allocated.as_ref()?;
+        Some(allocated.function_extents().into_iter().collect())
+    }
+
     /// Returns the function call trampolines allocated in memory of this
     /// `Artifact`, ready to be run.
     pub fn finished_function_call_trampolines(&self) -> &BoxedSlice<SignatureIndex, VMTrampoline> {
@@ -812,7 +851,7 @@ impl Artifact {
     }
 
     /// Returns the associated VM signatures for this `Artifact`.
-    pub fn signatures(&self) -> &BoxedSlice<SignatureIndex, VMSharedSignatureIndex> {
+    pub fn signatures(&self) -> &BoxedSlice<SignatureIndex, VMSignatureHash> {
         &self
             .allocated
             .as_ref()
@@ -868,8 +907,18 @@ impl Artifact {
             // Get pointers to where metadata about local memories should live in VM memory.
             // Get pointers to where metadata about local tables should live in VM memory.
 
-            let (allocator, memory_definition_locations, table_definition_locations) =
-                InstanceAllocator::new(&module);
+            let cached_offsets = self
+                .allocated
+                .as_ref()
+                .map(|a| a.vm_offsets.clone())
+                .expect("Artifact::instantiate called on a non-host artifact");
+
+            let (
+                allocator,
+                memory_definition_locations,
+                table_definition_locations,
+                global_definition_locations,
+            ) = InstanceAllocator::new_with_offsets(cached_offsets, &module);
             let finished_memories = tunables
                 .create_memories(
                     context,
@@ -889,7 +938,7 @@ impl Artifact {
                 .map_err(InstantiationError::Link)?
                 .into_boxed_slice();
             let finished_globals = tunables
-                .create_globals(context, &module)
+                .create_globals(context, &module, &global_definition_locations)
                 .map_err(InstantiationError::Link)?
                 .into_boxed_slice();
 
@@ -1086,7 +1135,7 @@ impl Artifact {
         - TableIndex -> TableStyle
         - LocalFunctionIndex -> FunctionBodyPtr // finished functions
         - FunctionIndex -> FunctionBodyPtr // finished dynamic function trampolines
-        - SignatureIndex -> VMSharedSignatureindextureIndex // signatures
+        - SignatureIndex -> VMSignatureHash // signatures
          */
 
         let mut metadata_builder =
@@ -1099,6 +1148,7 @@ impl Artifact {
             &metadata.compile_info,
             module_translation.as_ref().unwrap(),
             function_body_inputs,
+            None,
         )?;
         let mut obj = get_object_for_target(target_triple).map_err(to_compile_error)?;
 
@@ -1121,11 +1171,13 @@ impl Artifact {
             _ => 1,
         };
 
+        // MetadataHeader::parse requires that metadata must be aligned
+        // by 8 bytes.
         let offset = emit_data(
             &mut obj,
             object_name.as_bytes(),
             metadata_builder.placeholder_data(),
-            default_align,
+            std::cmp::max(8, default_align),
         )
         .map_err(to_compile_error)?;
         metadata_builder.set_section_offset(offset);
@@ -1220,12 +1272,12 @@ impl Artifact {
 
             // We register all the signatures
             let signatures = {
-                metadata
-                    .compile_info
-                    .module
+                let module = &metadata.compile_info.module;
+                module
                     .signatures
                     .values()
-                    .map(|sig| signature_registry.register(sig))
+                    .zip(module.signature_hashes.values())
+                    .map(|(sig, sig_hash)| signature_registry.register(sig, *sig_hash))
                     .collect::<PrimaryMap<_, _>>()
             };
 
@@ -1280,9 +1332,17 @@ impl Artifact {
                 .collect::<PrimaryMap<LocalFunctionIndex, usize>>()
                 .into_boxed_slice();
 
+            // Variant is built first so its module_info is available for
+            // the cached VMOffsets before it is moved into Self.
+            let artifact_variant = ArtifactBuildVariant::Plain(artifact);
+            let vm_offsets = VMOffsets::new(
+                std::mem::size_of::<usize>() as u8,
+                artifact_variant.module_info(),
+            );
+
             Ok(Self {
                 id: Default::default(),
-                artifact: ArtifactBuildVariant::Plain(artifact),
+                artifact: artifact_variant,
                 allocated: Some(AllocatedArtifact {
                     frame_info_registered: false,
                     frame_info_registration: None,
@@ -1293,6 +1353,7 @@ impl Artifact {
                         .into_boxed_slice(),
                     signatures: signatures.into_boxed_slice(),
                     finished_function_lengths,
+                    vm_offsets,
                 }),
             })
         }

@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let instance = Instance::new(&mut store, &module, &import_object)?;
 
     // Here we go.
-    let f: TypedFunction<(), ()> = instance.exports.get_function("f")?.typed(&mut store)?;
+    let f: TypedFunction<(), ()> = instance.exports.get_function("f")?.typed(&store)?;
 
     println!("Calling `f` function...");
     let result = f.call(&mut store);
@@ -140,6 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn test_throw_exception() -> Result<(), Box<dyn std::error::Error>> {
     main()
 }

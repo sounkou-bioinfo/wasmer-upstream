@@ -4,6 +4,10 @@ use wasmer_types::{FrameInfo, ImportError, TrapCode};
 
 use crate::{AsStoreMut, AsStoreRef, BackendTrap as Trap, Exception, Value};
 
+// This type used to be exported from this module, so re-export for
+// backwards compatibility.
+pub use wasmer_types::error::AtomicsError;
+
 /// The WebAssembly.LinkError object indicates an error during
 /// module instantiation (besides traps from the start function).
 ///
@@ -41,7 +45,7 @@ pub enum InstantiationError {
     #[cfg_attr(feature = "std", error(transparent))]
     Link(LinkError),
 
-    /// A runtime error occured while invoking the start function
+    /// A runtime error occurred while invoking the start function
     #[cfg_attr(feature = "std", error(transparent))]
     Start(RuntimeError),
 
@@ -164,7 +168,7 @@ impl RuntimeError {
             #[cfg(feature = "sys")]
             crate::StoreObjects::Sys(ref store_objects) => {
                 crate::backend::sys::vm::Trap::uncaught_exception(
-                    exnref.as_sys().clone(),
+                    exnref.unwrap_sys_ref().clone(),
                     store_objects,
                 )
                 .into()
@@ -249,10 +253,7 @@ impl RuntimeError {
             writeln!(f)?;
             write!(f, "    at ")?;
             match frame.function_name() {
-                Some(name) => match rustc_demangle::try_demangle(name) {
-                    Ok(name) => write!(f, "{name}")?,
-                    Err(_) => write!(f, "{name}")?,
-                },
+                Some(name) => write!(f, "{}", symbolic_demangle::demangle(name))?,
                 None => write!(f, "<unnamed>")?,
             }
             write!(
@@ -264,6 +265,13 @@ impl RuntimeError {
             )?;
         }
         Ok(())
+    }
+
+    pub(crate) fn from_dyn(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        match err.downcast::<Self>() {
+            Ok(runtime_error) => *runtime_error,
+            Err(error) => Trap::user(error),
+        }
     }
 }
 
@@ -318,29 +326,6 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for RuntimeError {
             // The error is already a RuntimeError, we return it directly
             Ok(runtime_error) => *runtime_error,
             Err(error) => Trap::user(error),
-        }
-    }
-}
-
-/// Error that can occur during atomic operations. (notify/wait)
-// Non-exhaustive to allow for future variants without breaking changes!
-#[derive(PartialEq, Eq, Debug, Error)]
-#[non_exhaustive]
-pub enum AtomicsError {
-    /// Atomic operations are not supported by this memory.
-    Unimplemented,
-    /// To many waiter for address.
-    TooManyWaiters,
-    /// Atomic operations are disabled.
-    AtomicsDisabled,
-}
-
-impl std::fmt::Display for AtomicsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unimplemented => write!(f, "Atomic operations are not supported"),
-            Self::TooManyWaiters => write!(f, "Too many waiters for address"),
-            Self::AtomicsDisabled => write!(f, "Atomic operations are disabled"),
         }
     }
 }

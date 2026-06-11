@@ -80,7 +80,7 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
     };
 
     // If we were just restored the stack then we were woken after a deep sleep
-    // and the return calues are already set
+    // and the return values are already set
     if let Some(status) = unsafe { handle_rewind::<M, _>(&mut ctx) } {
         let ret = ret_result(ctx, status);
         tracing::trace!("rewound join ret={:?}", ret);
@@ -93,6 +93,7 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
     let option_pid = match option_pid.tag {
         OptionTag::None => None,
         OptionTag::Some => Some(option_pid.pid),
+        _ => return Ok(Errno::Inval),
     };
     tracing::trace!("filter_pid = {:?}", option_pid);
 

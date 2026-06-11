@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::num::NonZero;
 
 use super::{
     intrinsics::{
@@ -7,34 +8,41 @@ use super::{
     // stackmap::{StackmapEntry, StackmapEntryKind, StackmapRegistry, ValueSemantic},
     state::{ControlFrame, ExtraInfo, IfElseState, State, TagCatchInfo},
 };
+use crate::{compiler::ModuleBasedSymbolRegistry, config::OptimizationStyle};
+use enumset::EnumSet;
 use inkwell::{
     AddressSpace, AtomicOrdering, AtomicRMWBinOp, DLLStorageClass, FloatPredicate, IntPredicate,
-    attributes::AttributeLoc,
+    attributes::{Attribute, AttributeLoc},
     builder::Builder,
     context::Context,
     module::{Linkage, Module},
     passes::PassBuilderOptions,
-    targets::{FileType, TargetMachine},
+    targets::{FileType, TargetData, TargetMachine},
     types::{BasicType, BasicTypeEnum, FloatMathType, IntType, PointerType, VectorType},
     values::{
         BasicMetadataValueEnum, BasicValue, BasicValueEnum, CallSiteValue, FloatValue,
-        FunctionValue, InstructionOpcode, InstructionValue, IntValue, PhiValue, PointerValue,
-        VectorValue,
+        FunctionValue, InstructionOpcode, InstructionValue, IntValue, LLVMTailCallKind, PhiValue,
+        PointerValue, VectorValue,
     },
 };
 use itertools::Itertools;
 use smallvec::SmallVec;
-use target_lexicon::BinaryFormat;
+use target_lexicon::{Architecture, BinaryFormat, OperatingSystem, Triple};
+use wasmer_compiler::WASM_LARGE_FUNCTION_THRESHOLD;
 
 use crate::{
-    abi::{Abi, G0M0FunctionKind, LocalFunctionG0M0params, get_abi},
+    abi::{Abi, get_abi},
     config::LLVM,
     error::{err, err_nt},
     object_file::{CompiledFunction, load_object_file},
 };
 use wasmer_compiler::{
-    FunctionBinaryReader, FunctionBodyData, MiddlewareBinaryReader, ModuleMiddlewareChain,
-    ModuleTranslationState, from_binaryreadererror_wasmerror,
+    CANONICAL_NAN_F32, CANONICAL_NAN_F64, FunctionBinaryReader, FunctionBodyData,
+    GEF32_LEQ_I32_MAX, GEF32_LEQ_I64_MAX, GEF32_LEQ_U32_MAX, GEF32_LEQ_U64_MAX, GEF64_LEQ_I32_MAX,
+    GEF64_LEQ_I64_MAX, GEF64_LEQ_U32_MAX, GEF64_LEQ_U64_MAX, LEF32_GEQ_I32_MIN, LEF32_GEQ_I64_MIN,
+    LEF32_GEQ_U32_MIN, LEF32_GEQ_U64_MIN, LEF64_GEQ_I32_MIN, LEF64_GEQ_I64_MIN, LEF64_GEQ_U32_MIN,
+    LEF64_GEQ_U64_MIN, MiddlewareBinaryReader, ModuleMiddlewareChain, ModuleTranslationState,
+    from_binaryreadererror_wasmerror,
     misc::CompiledKind,
     types::{
         relocation::RelocationTarget,
@@ -45,7 +53,7 @@ use wasmer_compiler::{
 };
 use wasmer_types::{
     CompileError, FunctionIndex, FunctionType, GlobalIndex, LocalFunctionIndex, MemoryIndex,
-    ModuleInfo, SignatureIndex, TableIndex, Type,
+    ModuleInfo, SignatureHash, SignatureIndex, TableIndex, Type, target::CpuFeature,
 };
 use wasmer_types::{TagIndex, entity::PrimaryMap};
 use wasmer_vm::{MemoryStyle, TableStyle, VMOffsets};
@@ -63,21 +71,37 @@ const CATCH_ALL_TAG_VALUE: i32 = i32::MAX;
 
 pub struct FuncTranslator {
     ctx: Context,
-    target_machine: TargetMachine,
+    target_triple: Triple,
+    target_machines: HashMap<OptimizationStyle, TargetMachine>,
     abi: Box<dyn Abi>,
     binary_fmt: BinaryFormat,
     func_section: String,
+    pointer_width: u8,
+    cpu_features: EnumSet<CpuFeature>,
+    non_volatile_memory_ops: bool,
+    wasm_apply_data_relocs_fn_index: Option<FunctionIndex>,
 }
+
+impl wasmer_compiler::FuncTranslator for FuncTranslator {}
 
 impl FuncTranslator {
     pub fn new(
-        target_machine: TargetMachine,
+        target_triple: Triple,
+        target_machines: HashMap<OptimizationStyle, TargetMachine>,
         binary_fmt: BinaryFormat,
+        pointer_width: u8,
+        cpu_features: EnumSet<CpuFeature>,
+        non_volatile_memory_ops: bool,
+        wasm_apply_data_relocs_fn_index: Option<FunctionIndex>,
     ) -> Result<Self, CompileError> {
-        let abi = get_abi(&target_machine);
+        let abi_source_tm = target_machines
+            .get(&OptimizationStyle::ForSpeed)
+            .expect("target_machines must contain OptimizationStyle::ForSpeed");
+        let abi = get_abi(abi_source_tm);
         Ok(Self {
             ctx: Context::create(),
-            target_machine,
+            target_triple,
+            target_machines,
             abi,
             func_section: match binary_fmt {
                 BinaryFormat::Elf => FUNCTION_SECTION_ELF.to_string(),
@@ -89,6 +113,10 @@ impl FuncTranslator {
                 }
             },
             binary_fmt,
+            pointer_width,
+            cpu_features,
+            non_volatile_memory_ops,
+            wasm_apply_data_relocs_fn_index,
         })
     }
 
@@ -97,12 +125,15 @@ impl FuncTranslator {
         &self,
         wasm_module: &ModuleInfo,
         module_translation: &ModuleTranslationState,
+        signature_hashes: &PrimaryMap<SignatureIndex, SignatureHash>,
         local_func_index: &LocalFunctionIndex,
         function_body: &FunctionBodyData,
         config: &LLVM,
         memory_styles: &PrimaryMap<MemoryIndex, MemoryStyle>,
         _table_styles: &PrimaryMap<TableIndex, TableStyle>,
         symbol_registry: &dyn SymbolRegistry,
+        target: &Triple,
+        opt_style: OptimizationStyle,
     ) -> Result<Module<'_>, CompileError> {
         // The function type, used for the callbacks.
         let func_index = wasm_module.func_index(*local_func_index);
@@ -111,12 +142,11 @@ impl FuncTranslator {
         let function_name =
             symbol_registry.symbol_to_name(Symbol::LocalFunction(*local_func_index));
 
-        let g0m0_is_enabled = config.enable_g0m0_opt;
-        let func_kind = if g0m0_is_enabled {
-            Some(G0M0FunctionKind::Local)
-        } else {
-            None
-        };
+        // We can pass and use the heap pointer (memory #0) only and only if the memory static, that means
+        // the allocated heap is never moved to a different location.
+        let m0_is_enabled = memory_styles
+            .get(MemoryIndex::from_u32(0))
+            .is_some_and(|memory| matches!(memory, MemoryStyle::Static { .. }));
 
         let module_name = match wasm_module.name.as_ref() {
             None => format!("<anonymous module> function {function_name}"),
@@ -124,7 +154,7 @@ impl FuncTranslator {
         };
         let module = self.ctx.create_module(module_name.as_str());
 
-        let target_machine = &self.target_machine;
+        let target_machine = &self.target_machines.values().next().unwrap();
         let target_triple = target_machine.get_triple();
         let target_data = target_machine.get_target_data();
         module.set_triple(&target_triple);
@@ -134,15 +164,20 @@ impl FuncTranslator {
             .get(wasm_module.functions[func_index])
             .unwrap();
 
-        // TODO: pointer width
-        let offsets = VMOffsets::new(8, wasm_module);
-        let intrinsics = Intrinsics::declare(&module, &self.ctx, &target_data, &self.binary_fmt);
+        let offsets = VMOffsets::new(self.pointer_width, wasm_module);
+        let intrinsics = Intrinsics::declare(
+            &module,
+            &self.ctx,
+            &target_data,
+            &self.target_triple,
+            &self.binary_fmt,
+        );
         let (func_type, func_attrs) = self.abi.func_type_to_llvm(
             &self.ctx,
             &intrinsics,
             Some(&offsets),
             wasm_fn_type,
-            func_kind,
+            m0_is_enabled,
         )?;
 
         let func = module.add_function(&function_name, func_type, Some(Linkage::External));
@@ -150,7 +185,10 @@ impl FuncTranslator {
             func.add_attribute(*attr_loc, *attr);
         }
 
-        func.add_attribute(AttributeLoc::Function, intrinsics.stack_probe);
+        if !matches!(target.operating_system, OperatingSystem::Windows) {
+            func.add_attribute(AttributeLoc::Function, intrinsics.stack_probe);
+        }
+
         func.add_attribute(AttributeLoc::Function, intrinsics.uwtable);
         func.add_attribute(AttributeLoc::Function, intrinsics.frame_pointer);
 
@@ -211,9 +249,9 @@ impl FuncTranslator {
         let mut params = vec![];
         let first_param =
             if func_type.get_return_type().is_none() && wasm_fn_type.results().len() > 1 {
-                if g0m0_is_enabled { 4 } else { 2 }
-            } else if g0m0_is_enabled {
-                3
+                if m0_is_enabled { 3 } else { 2 }
+            } else if m0_is_enabled {
+                2
             } else {
                 1
             };
@@ -271,40 +309,47 @@ impl FuncTranslator {
         let mut params_locals = params.clone();
         params_locals.extend(locals.iter().cloned());
 
-        let mut g0m0_params = None;
+        let mut m0_param = None;
 
-        if g0m0_is_enabled {
-            let value = self.abi.get_g0_ptr_param(&func);
-            let g0 = insert_alloca(intrinsics.i32_ty.as_basic_type_enum(), "g0".to_string())?;
-            err!(cache_builder.build_store(g0, value));
-            g0.set_name("g0");
+        if m0_is_enabled {
             let m0 = self.abi.get_m0_ptr_param(&func);
             m0.set_name("m0_base_ptr");
-
-            g0m0_params = Some((g0, m0));
+            m0_param = Some(m0);
         }
 
         let mut fcg = LLVMFunctionCodeGenerator {
-            g0m0: g0m0_params,
+            m0_param,
             context: &self.ctx,
             builder,
             alloca_builder,
             intrinsics: &intrinsics,
+            target_data: &target_data,
             state,
             function: func,
             locals: params_locals,
-            ctx: CtxType::new(wasm_module, &func, &cache_builder, &*self.abi, config),
+            ctx: CtxType::new(
+                wasm_module,
+                &func,
+                &cache_builder,
+                &*self.abi,
+                self.pointer_width,
+                m0_param,
+            ),
             unreachable_depth: 0,
             memory_styles,
             _table_styles,
             module: &module,
             module_translation,
+            signature_hashes,
             wasm_module,
             symbol_registry,
             abi: &*self.abi,
             config,
+            target_triple: self.target_triple.clone(),
             tags_cache: HashMap::new(),
             binary_fmt: self.binary_fmt,
+            cpu_features: self.cpu_features,
+            non_volatile_memory_ops: self.non_volatile_memory_ops,
         };
 
         fcg.ctx.add_func(
@@ -324,70 +369,62 @@ impl FuncTranslator {
         fcg.finalize(wasm_fn_type)?;
 
         if let Some(ref callbacks) = config.callbacks {
-            callbacks.preopt_ir(&function, &module);
+            callbacks.preopt_ir(&function, &wasm_module.hash_string(), &module);
         }
 
         let mut passes = vec![];
-
         if config.enable_verifier {
             passes.push("verify");
         }
 
-        passes.push("sccp");
-        passes.push("early-cse");
-        //passes.push("deadargelim");
-        passes.push("adce");
-        passes.push("sroa");
-        passes.push("aggressive-instcombine");
-        passes.push("jump-threading");
-        //passes.push("ipsccp");
-        passes.push("simplifycfg");
-        passes.push("reassociate");
-        passes.push("loop-rotate");
-        passes.push("indvars");
-        //passes.push("lcssa");
-        //passes.push("licm");
-        //passes.push("instcombine");
-        passes.push("sccp");
-        passes.push("reassociate");
-        passes.push("simplifycfg");
-        passes.push("gvn");
-        passes.push("memcpyopt");
-        passes.push("dse");
-        passes.push("dce");
-        //passes.push("instcombine");
-        passes.push("reassociate");
-        passes.push("simplifycfg");
-        passes.push("mem2reg");
-
-        //let llvm_dump_path = std::env::var("WASMER_LLVM_DUMP_DIR");
-        //if let Ok(ref llvm_dump_path) = llvm_dump_path {
-        //    let path = std::path::Path::new(llvm_dump_path);
-        //    if !path.exists() {
-        //        std::fs::create_dir_all(path).unwrap()
-        //    }
-        //    let path = path.join(format!("{function_name}.ll"));
-        //    _ = module.print_to_file(path).unwrap();
-        //}
+        match opt_style {
+            OptimizationStyle::Disabled => {
+                passes.push("default<O0>");
+            }
+            OptimizationStyle::ForSize => {
+                // Apparently, the default<Os> could be much slower compared to -O1.
+                passes.push("default<O1>");
+            }
+            OptimizationStyle::ForSpeed => {
+                passes.push("sccp");
+                passes.push("early-cse");
+                //passes.push("deadargelim");
+                passes.push("adce");
+                passes.push("sroa");
+                passes.push("aggressive-instcombine");
+                passes.push("jump-threading");
+                //passes.push("ipsccp");
+                passes.push("simplifycfg");
+                passes.push("reassociate");
+                passes.push("loop-rotate");
+                passes.push("indvars");
+                //passes.push("lcssa");
+                //passes.push("licm");
+                //passes.push("instcombine");
+                passes.push("sccp");
+                passes.push("reassociate");
+                passes.push("simplifycfg");
+                passes.push("gvn");
+                passes.push("memcpyopt");
+                passes.push("dse");
+                passes.push("dce");
+                //passes.push("instcombine");
+                passes.push("reassociate");
+                passes.push("simplifycfg");
+                passes.push("mem2reg");
+            }
+        }
 
         module
             .run_passes(
-                passes.join(",").as_str(),
+                &passes.join(","),
                 target_machine,
                 PassBuilderOptions::create(),
             )
             .unwrap();
 
-        //if let Ok(ref llvm_dump_path) = llvm_dump_path {
-        //    if !passes.is_empty() {
-        //        let path =
-        //            std::path::Path::new(llvm_dump_path).join(format!("{function_name}_opt.ll"));
-        //        _ = module.print_to_file(path).unwrap();
-        //    }
-        //}
-
         if let Some(ref callbacks) = config.callbacks {
-            callbacks.postopt_ir(&function, &module);
+            callbacks.postopt_ir(&function, &wasm_module.hash_string(), &module);
         }
 
         Ok(module)
@@ -398,38 +435,54 @@ impl FuncTranslator {
         &self,
         wasm_module: &ModuleInfo,
         module_translation: &ModuleTranslationState,
+        signature_hashes: &PrimaryMap<SignatureIndex, SignatureHash>,
         local_func_index: &LocalFunctionIndex,
         function_body: &FunctionBodyData,
         config: &LLVM,
         memory_styles: &PrimaryMap<MemoryIndex, MemoryStyle>,
         table_styles: &PrimaryMap<TableIndex, TableStyle>,
-        symbol_registry: &dyn SymbolRegistry,
+        symbol_registry: &ModuleBasedSymbolRegistry,
+        target: &Triple,
     ) -> Result<CompiledFunction, CompileError> {
+        let func_index = wasm_module.func_index(*local_func_index);
+        let opt_style = if Some(func_index) == self.wasm_apply_data_relocs_fn_index {
+            // `__wasm_apply_data_relocs` can become a very large function made up
+            // mostly of loads and stores, and even `-O1` can spend significant
+            // time optimizing it.
+            OptimizationStyle::Disabled
+        } else if function_body.data.len() as u64 > WASM_LARGE_FUNCTION_THRESHOLD {
+            OptimizationStyle::ForSize
+        } else {
+            OptimizationStyle::ForSpeed
+        };
         let module = self.translate_to_module(
             wasm_module,
             module_translation,
+            signature_hashes,
             local_func_index,
             function_body,
             config,
             memory_styles,
             table_styles,
             symbol_registry,
+            target,
+            opt_style,
         )?;
-        let function = CompiledKind::Local(
-            *local_func_index,
-            wasm_module.get_function_name(wasm_module.func_index(*local_func_index)),
-        );
-        let target_machine = &self.target_machine;
+        let function =
+            CompiledKind::Local(*local_func_index, wasm_module.get_function_name(func_index));
+
+        let target_machine = self.target_machines.get(&opt_style).unwrap();
         let memory_buffer = target_machine
             .write_to_memory_buffer(&module, FileType::Object)
             .unwrap();
 
         if let Some(ref callbacks) = config.callbacks {
-            callbacks.obj_memory_buffer(&function, &memory_buffer);
+            let module_hash = wasm_module.hash().map(|m| m.to_string());
+            callbacks.obj_memory_buffer(&function, &module_hash, &memory_buffer);
             let asm_buffer = target_machine
                 .write_to_memory_buffer(&module, FileType::Assembly)
                 .unwrap();
-            callbacks.asm_memory_buffer(&function, &asm_buffer)
+            callbacks.asm_memory_buffer(&function, &module_hash, &asm_buffer)
         }
 
         let mem_buf_slice = memory_buffer.as_slice();
@@ -441,14 +494,11 @@ impl FuncTranslator {
             |name: &str| {
                 Ok({
                     let name = if matches!(self.binary_fmt, BinaryFormat::Macho) {
-                        if name.starts_with("_") {
-                            name.replacen("_", "", 1)
-                        } else {
-                            name.to_string()
-                        }
+                        name.strip_prefix("_").unwrap_or(name)
                     } else {
-                        name.to_string()
-                    };
+                        name
+                    }
+                    .to_string();
                     if let Some(Symbol::LocalFunction(local_func_index)) =
                         symbol_registry.name_to_symbol(&name)
                     {
@@ -459,6 +509,7 @@ impl FuncTranslator {
                 })
             },
             self.binary_fmt,
+            &self.target_triple,
         )
     }
 }
@@ -766,7 +817,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
         &self,
         lower_bound: u64, // Inclusive (not a trapping value)
         upper_bound: u64, // Inclusive (not a trapping value)
-        value: FloatValue,
+        value: FloatValue<'ctx>,
     ) -> Result<(), CompileError> {
         let float_ty = value.get_type();
         let int_ty = if float_ty == self.intrinsics.f32_ty {
@@ -832,10 +883,11 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             self.intrinsics.trap_illegal_arithmetic,
             "",
         ));
-        err!(
-            self.builder
-                .build_call(self.intrinsics.throw_trap, &[trap_code.into()], "throw")
-        );
+        self.build_call_with_param_attributes(
+            self.intrinsics.throw_trap,
+            &[trap_code.into()],
+            "throw",
+        )?;
         err!(self.builder.build_unreachable());
         self.builder.position_at_end(continue_block);
 
@@ -844,8 +896,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
 
     fn trap_if_zero_or_overflow(
         &self,
-        left: IntValue,
-        right: IntValue,
+        left: IntValue<'ctx>,
+        right: IntValue<'ctx>,
     ) -> Result<(), CompileError> {
         let int_type = left.get_type();
 
@@ -887,17 +939,18 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             "div_should_trap",
         ));
 
-        let should_trap = err!(self.builder.build_call(
-            self.intrinsics.expect_i1,
-            &[
-                should_trap.into(),
-                self.intrinsics.i1_ty.const_zero().into(),
-            ],
-            "should_trap_expect",
-        ))
-        .try_as_basic_value()
-        .unwrap_basic()
-        .into_int_value();
+        let should_trap = self
+            .build_call_with_param_attributes(
+                self.intrinsics.expect_i1,
+                &[
+                    should_trap.into(),
+                    self.intrinsics.i1_ty.const_zero().into(),
+                ],
+                "should_trap_expect",
+            )?
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
 
         let shouldnt_trap_block = self
             .context
@@ -927,7 +980,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
         Ok(())
     }
 
-    fn trap_if_zero(&self, value: IntValue) -> Result<(), CompileError> {
+    fn trap_if_zero(&self, value: IntValue<'ctx>) -> Result<(), CompileError> {
         let int_type = value.get_type();
         let should_trap = err!(self.builder.build_int_compare(
             IntPredicate::EQ,
@@ -936,17 +989,18 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             "divisor_is_zero",
         ));
 
-        let should_trap = err!(self.builder.build_call(
-            self.intrinsics.expect_i1,
-            &[
-                should_trap.into(),
-                self.intrinsics.i1_ty.const_zero().into(),
-            ],
-            "should_trap_expect",
-        ))
-        .try_as_basic_value()
-        .unwrap_basic()
-        .into_int_value();
+        let should_trap = self
+            .build_call_with_param_attributes(
+                self.intrinsics.expect_i1,
+                &[
+                    should_trap.into(),
+                    self.intrinsics.i1_ty.const_zero().into(),
+                ],
+                "should_trap_expect",
+            )?
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
 
         let shouldnt_trap_block = self
             .context
@@ -960,11 +1014,11 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             shouldnt_trap_block
         ));
         self.builder.position_at_end(should_trap_block);
-        err!(self.builder.build_call(
+        self.build_call_with_param_attributes(
             self.intrinsics.throw_trap,
             &[self.intrinsics.trap_integer_division_by_zero.into()],
             "throw",
-        ));
+        )?;
         err!(self.builder.build_unreachable());
         self.builder.position_at_end(shouldnt_trap_block);
 
@@ -977,18 +1031,22 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
         info: ExtraInfo,
         int_vec_ty: VectorType<'ctx>,
     ) -> Result<(VectorValue<'ctx>, ExtraInfo), CompileError> {
-        let (value, info) = if info.has_pending_f32_nan() {
-            let value = err!(
-                self.builder
-                    .build_bit_cast(value, self.intrinsics.f32x4_ty, "")
-            );
-            (self.canonicalize_nans(value)?, info.strip_pending())
-        } else if info.has_pending_f64_nan() {
-            let value = err!(
-                self.builder
-                    .build_bit_cast(value, self.intrinsics.f64x2_ty, "")
-            );
-            (self.canonicalize_nans(value)?, info.strip_pending())
+        let (value, info) = if self.config.enable_nan_canonicalization {
+            if info.has_pending_f32_nan() {
+                let value = err!(
+                    self.builder
+                        .build_bit_cast(value, self.intrinsics.f32x4_ty, "")
+                );
+                (self.canonicalize_nans(value)?, info.strip_pending())
+            } else if info.has_pending_f64_nan() {
+                let value = err!(
+                    self.builder
+                        .build_bit_cast(value, self.intrinsics.f64x2_ty, "")
+                );
+                (self.canonicalize_nans(value)?, info.strip_pending())
+            } else {
+                (value, info)
+            }
         } else {
             (value, info)
         };
@@ -1037,7 +1095,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
         value: BasicValueEnum<'ctx>,
         info: ExtraInfo,
     ) -> Result<(VectorValue<'ctx>, ExtraInfo), CompileError> {
-        let (value, info) = if info.has_pending_f64_nan() {
+        let (value, info) = if self.config.enable_nan_canonicalization && info.has_pending_f64_nan()
+        {
             let value = err!(
                 self.builder
                     .build_bit_cast(value, self.intrinsics.f64x2_ty, "")
@@ -1063,7 +1122,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
         value: BasicValueEnum<'ctx>,
         info: ExtraInfo,
     ) -> Result<(VectorValue<'ctx>, ExtraInfo), CompileError> {
-        let (value, info) = if info.has_pending_f32_nan() {
+        let (value, info) = if self.config.enable_nan_canonicalization && info.has_pending_f32_nan()
+        {
             let value = err!(
                 self.builder
                     .build_bit_cast(value, self.intrinsics.f32x4_ty, "")
@@ -1171,71 +1231,6 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
         }
     }
 
-    fn quiet_nan(&self, value: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>, CompileError> {
-        let intrinsic = if value
-            .get_type()
-            .eq(&self.intrinsics.f32_ty.as_basic_type_enum())
-        {
-            Some(self.intrinsics.add_f32)
-        } else if value
-            .get_type()
-            .eq(&self.intrinsics.f64_ty.as_basic_type_enum())
-        {
-            Some(self.intrinsics.add_f64)
-        } else if value
-            .get_type()
-            .eq(&self.intrinsics.f32x4_ty.as_basic_type_enum())
-        {
-            Some(self.intrinsics.add_f32x4)
-        } else if value
-            .get_type()
-            .eq(&self.intrinsics.f64x2_ty.as_basic_type_enum())
-        {
-            Some(self.intrinsics.add_f64x2)
-        } else {
-            None
-        };
-
-        match intrinsic {
-            Some(intrinsic) => err_nt!(
-                self.builder
-                    .build_call(
-                        intrinsic,
-                        &[
-                            value.into(),
-                            value.get_type().const_zero().into(),
-                            self.intrinsics.fp_rounding_md,
-                            self.intrinsics.fp_exception_md,
-                        ],
-                        "",
-                    )
-                    .map(|v| v.try_as_basic_value().unwrap_basic())
-            ),
-            None => Ok(value),
-        }
-    }
-
-    // If this memory access must trap when out of bounds (i.e. it is a memory
-    // access written in the user program as opposed to one used by our VM)
-    // then mark that it can't be delete.
-    fn mark_memaccess_nodelete(
-        &mut self,
-        memory_index: MemoryIndex,
-        memaccess: InstructionValue<'ctx>,
-    ) -> Result<(), CompileError> {
-        if let MemoryCache::Static { base_ptr: _ } = self.ctx.memory(
-            memory_index,
-            self.intrinsics,
-            self.module,
-            self.memory_styles,
-        )? {
-            // The best we've got is `volatile`.
-            // TODO: convert unwrap fail to CompileError
-            memaccess.set_volatile(true).unwrap();
-        }
-        Ok(())
-    }
-
     fn annotate_user_memaccess(
         &mut self,
         memory_index: MemoryIndex,
@@ -1249,13 +1244,365 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             _ => {}
         };
-        self.mark_memaccess_nodelete(memory_index, memaccess)?;
+        if !self.non_volatile_memory_ops {
+            // If this memory access must trap when out of bounds (i.e. it is a memory
+            // access written in the user program as opposed to one used by our VM)
+            // then mark that it can't be deleted.
+            if let MemoryCache::Static { base_ptr: _ } = self.ctx.memory(
+                memory_index,
+                self.intrinsics,
+                self.module,
+                self.memory_styles,
+            )? {
+                // The best we've got is `volatile`.
+                memaccess.set_volatile(true).map_err(|err| {
+                    CompileError::Codegen(format!(
+                        "could not set volatile on memory operation: {err}"
+                    ))
+                })?;
+            }
+        }
         tbaa_label(
             self.module,
             self.intrinsics,
             format!("memory {}", memory_index.as_u32()),
             memaccess,
         );
+        Ok(())
+    }
+
+    fn build_annotated_load<T: BasicType<'ctx>>(
+        &mut self,
+        pointee_ty: T,
+        offset: IntValue<'ctx>,
+        memarg: &MemArg,
+        alignment: u32,
+    ) -> Result<BasicValueEnum<'ctx>, CompileError> {
+        let memory_index = MemoryIndex::from_u32(memarg.memory);
+        let pointee_size = usize::try_from(self.target_data.get_store_size(&pointee_ty))
+            .map_err(|_| CompileError::Codegen("pointee type size does not fit in usize".into()))?;
+        let effective_address = self.resolve_memory_ptr(
+            memory_index,
+            memarg,
+            self.intrinsics.ptr_ty,
+            offset,
+            pointee_size,
+        )?;
+        let result = err!(self.builder.build_load(pointee_ty, effective_address, ""));
+        self.annotate_user_memaccess(
+            MemoryIndex::from_u32(memarg.memory),
+            memarg,
+            alignment,
+            result.as_instruction_value().unwrap(),
+        )?;
+        Ok(result)
+    }
+
+    fn build_annotated_atomic_load(
+        &mut self,
+        outer_ty: IntType<'ctx>,
+        inner_ty: IntType<'ctx>,
+        offset: IntValue<'ctx>,
+        memarg: &MemArg,
+    ) -> Result<IntValue<'ctx>, CompileError> {
+        let alignment = 2u32.pow(memarg.align as u32);
+        let memory_index = MemoryIndex::from_u32(memarg.memory);
+        let inner_size =
+            usize::try_from(self.target_data.get_store_size(&inner_ty)).map_err(|_| {
+                CompileError::Codegen("atomic inner type size does not fit in usize".into())
+            })?;
+        let outer_size =
+            usize::try_from(self.target_data.get_store_size(&outer_ty)).map_err(|_| {
+                CompileError::Codegen("atomic outer type size does not fit in usize".into())
+            })?;
+
+        let effective_address = self.resolve_memory_ptr(
+            memory_index,
+            memarg,
+            self.intrinsics.ptr_ty,
+            offset,
+            inner_size,
+        )?;
+        self.trap_if_misaligned(
+            memarg,
+            effective_address,
+            u8::try_from(inner_size).map_err(|_| {
+                CompileError::Codegen("atomic inner type size does not fit in u8".into())
+            })?,
+        )?;
+
+        let result = err!(
+            self.builder
+                .build_load(inner_ty, effective_address, "atomic_load")
+        );
+        let load = result.into_int_value();
+        let load_inst = load.as_instruction_value().unwrap();
+        self.annotate_user_memaccess(memory_index, memarg, alignment, load_inst)?;
+        load_inst
+            .set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
+            .unwrap();
+
+        if inner_size < outer_size {
+            Ok(err_nt!(
+                self.builder.build_int_z_extend(load, outer_ty, "")
+            )?)
+        } else {
+            Ok(load)
+        }
+    }
+
+    fn build_annotated_store<T: BasicType<'ctx>>(
+        &mut self,
+        pointee_ty: T,
+        offset: IntValue<'ctx>,
+        value: BasicValueEnum<'ctx>,
+        memarg: &MemArg,
+        alignment: u32,
+    ) -> Result<(), CompileError> {
+        let memory_index = MemoryIndex::from_u32(memarg.memory);
+        let pointee_size = usize::try_from(self.target_data.get_store_size(&pointee_ty))
+            .map_err(|_| CompileError::Codegen("pointee type size does not fit in usize".into()))?;
+        let effective_address = self.resolve_memory_ptr(
+            memory_index,
+            memarg,
+            self.intrinsics.ptr_ty,
+            offset,
+            pointee_size,
+        )?;
+
+        // Build a dead load (if non-volatile memory operations are disabled) to preserve
+        // artifacts from partial store operations.
+        if !self.non_volatile_memory_ops {
+            self.build_annotated_load(pointee_ty, offset, memarg, alignment)?;
+        }
+
+        let store = err!(self.builder.build_store(effective_address, value));
+        self.annotate_user_memaccess(memory_index, memarg, alignment, store)
+    }
+
+    fn build_annotated_atomic_store(
+        &mut self,
+        outer_ty: IntType<'ctx>,
+        inner_ty: IntType<'ctx>,
+        offset: IntValue<'ctx>,
+        value: IntValue<'ctx>,
+        memarg: &MemArg,
+    ) -> Result<(), CompileError> {
+        let alignment = 2u32.pow(memarg.align as u32);
+        let memory_index = MemoryIndex::from_u32(memarg.memory);
+        let inner_size =
+            usize::try_from(self.target_data.get_store_size(&inner_ty)).map_err(|_| {
+                CompileError::Codegen("atomic inner type size does not fit in usize".into())
+            })?;
+        let outer_size =
+            usize::try_from(self.target_data.get_store_size(&outer_ty)).map_err(|_| {
+                CompileError::Codegen("atomic outer type size does not fit in usize".into())
+            })?;
+
+        let effective_address = self.resolve_memory_ptr(
+            memory_index,
+            memarg,
+            self.intrinsics.ptr_ty,
+            offset,
+            inner_size,
+        )?;
+        self.trap_if_misaligned(
+            memarg,
+            effective_address,
+            u8::try_from(inner_size).map_err(|_| {
+                CompileError::Codegen("atomic inner type size does not fit in u8".into())
+            })?,
+        )?;
+
+        let value = if inner_size < outer_size {
+            err!(self.builder.build_int_truncate(value, inner_ty, ""))
+        } else {
+            value
+        };
+        let store = err!(self.builder.build_store(effective_address, value));
+        self.annotate_user_memaccess(memory_index, memarg, alignment, store)?;
+        store
+            .set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
+            .unwrap();
+        Ok(())
+    }
+
+    fn build_annotated_atomic_rmw(
+        &mut self,
+        outer_ty: IntType<'ctx>,
+        inner_ty: IntType<'ctx>,
+        offset: IntValue<'ctx>,
+        value: IntValue<'ctx>,
+        memarg: &MemArg,
+        op: AtomicRMWBinOp,
+    ) -> Result<IntValue<'ctx>, CompileError> {
+        let alignment = 2u32.pow(memarg.align as u32);
+        let memory_index = MemoryIndex::from_u32(memarg.memory);
+        let inner_size =
+            usize::try_from(self.target_data.get_store_size(&inner_ty)).map_err(|_| {
+                CompileError::Codegen("atomic inner type size does not fit in usize".into())
+            })?;
+        let outer_size =
+            usize::try_from(self.target_data.get_store_size(&outer_ty)).map_err(|_| {
+                CompileError::Codegen("atomic outer type size does not fit in usize".into())
+            })?;
+
+        let effective_address = self.resolve_memory_ptr(
+            memory_index,
+            memarg,
+            self.intrinsics.ptr_ty,
+            offset,
+            inner_size,
+        )?;
+        self.trap_if_misaligned(
+            memarg,
+            effective_address,
+            u8::try_from(inner_size).map_err(|_| {
+                CompileError::Codegen("atomic inner type size does not fit in u8".into())
+            })?,
+        )?;
+        let value = if inner_size < outer_size {
+            err!(self.builder.build_int_truncate(value, inner_ty, ""))
+        } else {
+            value
+        };
+        let old = self
+            .builder
+            .build_atomicrmw(
+                op,
+                effective_address,
+                value,
+                AtomicOrdering::SequentiallyConsistent,
+            )
+            .unwrap();
+        self.annotate_user_memaccess(
+            memory_index,
+            memarg,
+            alignment,
+            old.as_instruction_value().unwrap(),
+        )?;
+
+        let value = if inner_size < outer_size {
+            err!(self.builder.build_int_z_extend(old, outer_ty, ""))
+        } else {
+            old
+        };
+        Ok(value)
+    }
+
+    fn build_annotated_atomic_rmw_cmpxchg(
+        &mut self,
+        outer_ty: IntType<'ctx>,
+        inner_ty: IntType<'ctx>,
+        offset: IntValue<'ctx>,
+        cmp: IntValue<'ctx>,
+        new: IntValue<'ctx>,
+        memarg: &MemArg,
+    ) -> Result<IntValue<'ctx>, CompileError> {
+        let alignment = 2u32.pow(memarg.align as u32);
+        let memory_index = MemoryIndex::from_u32(memarg.memory);
+        let inner_size =
+            usize::try_from(self.target_data.get_store_size(&inner_ty)).map_err(|_| {
+                CompileError::Codegen("atomic inner type size does not fit in usize".into())
+            })?;
+        let outer_size =
+            usize::try_from(self.target_data.get_store_size(&outer_ty)).map_err(|_| {
+                CompileError::Codegen("atomic outer type size does not fit in usize".into())
+            })?;
+
+        let effective_address = self.resolve_memory_ptr(
+            memory_index,
+            memarg,
+            self.intrinsics.ptr_ty,
+            offset,
+            inner_size,
+        )?;
+        self.trap_if_misaligned(
+            memarg,
+            effective_address,
+            u8::try_from(inner_size).map_err(|_| {
+                CompileError::Codegen("atomic inner type size does not fit in u8".into())
+            })?,
+        )?;
+        let (cmp, new) = if inner_size < outer_size {
+            (
+                err!(self.builder.build_int_truncate(cmp, inner_ty, "")),
+                err!(self.builder.build_int_truncate(new, inner_ty, "")),
+            )
+        } else {
+            (cmp, new)
+        };
+        let old = self
+            .builder
+            .build_cmpxchg(
+                effective_address,
+                cmp,
+                new,
+                AtomicOrdering::SequentiallyConsistent,
+                AtomicOrdering::SequentiallyConsistent,
+            )
+            .unwrap();
+        self.annotate_user_memaccess(
+            memory_index,
+            memarg,
+            alignment,
+            old.as_instruction_value().unwrap(),
+        )?;
+        let old = self
+            .builder
+            .build_extract_value(old, 0, "")
+            .unwrap()
+            .into_int_value();
+
+        let value = if inner_size < outer_size {
+            err!(self.builder.build_int_z_extend(old, outer_ty, ""))
+        } else {
+            old
+        };
+        Ok(value)
+    }
+
+    fn translate_atomic_rmw(
+        &mut self,
+        outer_ty: IntType<'ctx>,
+        inner_ty: IntType<'ctx>,
+        memarg: &MemArg,
+        op: AtomicRMWBinOp,
+        extra_info: Option<ExtraInfo>,
+    ) -> Result<(), CompileError> {
+        let value = self.state.pop1()?.into_int_value();
+        let offset = self.state.pop1()?.into_int_value();
+        let old = self.build_annotated_atomic_rmw(outer_ty, inner_ty, offset, value, memarg, op)?;
+        if let Some(extra_info) = extra_info {
+            self.state.push1_extra(old, extra_info);
+        } else {
+            self.state.push1(old);
+        }
+        Ok(())
+    }
+
+    fn translate_atomic_rmw_cmpxchg(
+        &mut self,
+        outer_ty: IntType<'ctx>,
+        inner_ty: IntType<'ctx>,
+        memarg: &MemArg,
+        extra_info: Option<ExtraInfo>,
+    ) -> Result<(), CompileError> {
+        let ((cmp, cmp_info), (new, new_info)) = self.state.pop2_extra()?;
+        let cmp = self
+            .apply_pending_canonicalization(cmp, cmp_info)?
+            .into_int_value();
+        let new = self
+            .apply_pending_canonicalization(new, new_info)?
+            .into_int_value();
+        let offset = self.state.pop1()?.into_int_value();
+        let old =
+            self.build_annotated_atomic_rmw_cmpxchg(outer_ty, inner_ty, offset, cmp, new, memarg)?;
+        if let Some(extra_info) = extra_info {
+            self.state.push1_extra(old, extra_info);
+        } else {
+            self.state.push1(old);
+        }
         Ok(())
     }
 
@@ -1278,8 +1625,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
         let offset = err!(builder.build_int_add(var_offset, imm_offset, ""));
 
         // Look up the memory base (as pointer) and bounds (as unsigned integer).
-        let base_ptr = if let Some((_, ref m0)) = self.g0m0 {
-            *m0
+        let base_ptr = if let Some(m0) = self.m0_param {
+            m0
         } else {
             match self
                 .ctx
@@ -1352,7 +1699,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                         // constant expression, not known to be either true or false yet.
                         // If it's false, unknown-but-constant, or not-a-constant, emit a
                         // runtime bounds check. LLVM may yet succeed at optimizing it away.
-                        let ptr_in_bounds = err!(builder.build_call(
+                        let ptr_in_bounds = err!(self.build_call_with_param_attributes(
                             intrinsics.expect_i1,
                             &[
                                 ptr_in_bounds.into(),
@@ -1374,7 +1721,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                             not_in_bounds_block,
                         ));
                         builder.position_at_end(not_in_bounds_block);
-                        err!(builder.build_call(
+                        err!(self.build_call_with_param_attributes(
                             intrinsics.throw_trap,
                             &[intrinsics.trap_memory_oob.into()],
                             "throw",
@@ -1431,17 +1778,18 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             self.intrinsics.i64_zero,
             "is_aligned"
         ));
-        let aligned = err!(self.builder.build_call(
-            self.intrinsics.expect_i1,
-            &[
-                aligned.into(),
-                self.intrinsics.i1_ty.const_int(1, false).into(),
-            ],
-            "is_aligned_expect",
-        ))
-        .try_as_basic_value()
-        .unwrap_basic()
-        .into_int_value();
+        let aligned = self
+            .build_call_with_param_attributes(
+                self.intrinsics.expect_i1,
+                &[
+                    aligned.into(),
+                    self.intrinsics.i1_ty.const_int(1, false).into(),
+                ],
+                "is_aligned_expect",
+            )?
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
 
         let continue_block = self
             .context
@@ -1455,11 +1803,11 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
         );
 
         self.builder.position_at_end(not_aligned_block);
-        err!(self.builder.build_call(
+        self.build_call_with_param_attributes(
             self.intrinsics.throw_trap,
             &[self.intrinsics.trap_unaligned_atomic.into()],
             "throw",
-        ));
+        )?;
         err!(self.builder.build_unreachable());
 
         self.builder.position_at_end(continue_block);
@@ -1546,7 +1894,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
 
         tag_glbl.set_linkage(Linkage::External);
         tag_glbl.set_constant(true);
-        // Why set this to a specific section? On macOS it would land on a specifc read only data
+        // Why set this to a specific section? On macOS it would land on a specific read only data
         // section. GOT-based relocations will probably be generated with a non-zero addend, making
         // some EH-related intricacies not working.
         //
@@ -1563,19 +1911,64 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
         tag_glbl
     }
 
-    fn build_g0m0_indirect_call(
+    fn emit_return_call(
+        &mut self,
+        call_site: CallSiteValue<'ctx>,
+        callee_llvm_func_type: inkwell::types::FunctionType<'ctx>,
+    ) -> Result<(), CompileError> {
+        // This is an unintuitive spec corner case: a tail call must bypass all enclosing
+        // try_table blocks in the function. See https://github.com/WebAssembly/exception-handling/issues/249.
+        //
+        // The LLVM MustTail is more restrictive than the one defined in the WebAssembly spec.
+        // WebAssembly types alone are not enough here: the lowered ABI can add hidden arguments
+        // like `m0` and `sret`, so we must compare the actual LLVM function types instead.
+        let tail_call_kind = if self.function.get_type() == callee_llvm_func_type {
+            LLVMTailCallKind::LLVMTailCallKindMustTail
+        } else {
+            LLVMTailCallKind::LLVMTailCallKindTail
+        };
+        call_site.set_tail_call_kind(tail_call_kind);
+
+        if self.function.get_type().get_return_type().is_none() {
+            err!(self.builder.build_return(None));
+        } else {
+            let ret = call_site.try_as_basic_value();
+            if ret.is_instruction() {
+                return Err(CompileError::Codegen(
+                    "return_call expected a non-void call result".to_string(),
+                ));
+            }
+            err!(self.builder.build_return(Some(&ret.unwrap_basic())));
+        }
+        Ok(())
+    }
+
+    // Return sret pointer if the functions needs the hidden argument for multiple return values.
+    fn current_sret_ptr(&self, func_type: &FunctionType) -> Option<PointerValue<'ctx>> {
+        self.abi.is_sret(func_type).ok().map(|_| {
+            self.function
+                .get_first_param()
+                .unwrap()
+                .into_pointer_value()
+        })
+    }
+
+    fn build_m0_indirect_call(
         &mut self,
         table_index: u32,
         ctx_ptr: PointerValue<'ctx>,
         func_type: &FunctionType,
         func_ptr: PointerValue<'ctx>,
         func_index: IntValue<'ctx>,
+        is_return_call: bool,
     ) -> Result<(), CompileError> {
-        let Some((g0, m0)) = self.g0m0 else {
+        let Some(m0) = self.m0_param else {
             return Err(CompileError::Codegen(
-                "Call to build_g0m0_indirect_call without g0m0 parameters!".to_string(),
+                "Call to build_m0_indirect_call without m0 parameter!".to_string(),
             ));
         };
+
+        let params = self.state.popn_save_extra(func_type.params().len())?;
 
         let mut local_func_indices = vec![];
         let mut foreign_func_indices = vec![];
@@ -1593,11 +1986,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
         }
 
-        // removed with mem2reg.
-        //
-        let g0_value = err!(self.builder.build_load(self.intrinsics.i32_ty, g0, "g0"));
-
-        let needs_switch = self.g0m0.is_some()
+        let needs_switch = self.m0_param.is_some()
             && !local_func_indices.is_empty()
             && !foreign_func_indices.is_empty();
 
@@ -1612,7 +2001,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 .context
                 .append_basic_block(self.function, "unreachable_indirect_call_branch");
 
-            let cont = self.context.append_basic_block(self.function, "cont");
+            let cont =
+                (!is_return_call).then(|| self.context.append_basic_block(self.function, "cont"));
 
             err!(
                 self.builder.build_switch(
@@ -1638,42 +2028,66 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
 
             //let current_block = self.builder.get_insert_block().unwrap();
             self.builder.position_at_end(local_idx_block);
-            let local_call_site = self.build_indirect_call(
+            let (local_call_site, local_llvm_func_type) = self.build_indirect_call_with_params(
                 ctx_ptr,
                 func_type,
                 func_ptr,
-                Some(G0M0FunctionKind::Local),
-                Some((g0_value.into_int_value(), m0)),
+                Some(m0),
+                is_return_call,
+                &params,
             )?;
 
-            let local_rets = self.abi.rets_from_call(
-                &self.builder,
-                self.intrinsics,
-                local_call_site,
-                func_type,
-            )?;
-
-            err!(self.builder.build_unconditional_branch(cont));
+            let local_rets = if is_return_call {
+                self.emit_return_call(local_call_site, local_llvm_func_type)?;
+                Vec::new()
+            } else {
+                let rets = self.abi.rets_from_call(
+                    &self.builder,
+                    self.intrinsics,
+                    local_call_site,
+                    func_type,
+                )?;
+                err!(
+                    self.builder
+                        .build_unconditional_branch(cont.expect("non-return call requires cont"))
+                );
+                rets
+            };
 
             self.builder.position_at_end(foreign_idx_block);
-            let foreign_call_site = self.build_indirect_call(
-                ctx_ptr,
-                func_type,
-                func_ptr,
-                Some(G0M0FunctionKind::Imported),
-                None,
-            )?;
+            let (foreign_call_site, foreign_llvm_func_type) = self
+                .build_indirect_call_with_params(
+                    ctx_ptr,
+                    func_type,
+                    func_ptr,
+                    None,
+                    is_return_call,
+                    &params,
+                )?;
 
-            let foreign_rets = self.abi.rets_from_call(
-                &self.builder,
-                self.intrinsics,
-                foreign_call_site,
-                func_type,
-            )?;
+            let foreign_rets = if is_return_call {
+                self.emit_return_call(foreign_call_site, foreign_llvm_func_type)?;
+                Vec::new()
+            } else {
+                let rets = self.abi.rets_from_call(
+                    &self.builder,
+                    self.intrinsics,
+                    foreign_call_site,
+                    func_type,
+                )?;
+                err!(
+                    self.builder
+                        .build_unconditional_branch(cont.expect("non-return call requires cont"))
+                );
+                rets
+            };
 
-            err!(self.builder.build_unconditional_branch(cont));
+            if is_return_call {
+                return Ok(());
+            }
 
-            self.builder.position_at_end(cont);
+            self.builder
+                .position_at_end(cont.expect("non-return call requires cont"));
 
             for i in 0..foreign_rets.len() {
                 let f_i = foreign_rets[i];
@@ -1684,30 +2098,40 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 self.state.push1(v.as_basic_value());
             }
         } else if foreign_func_indices.is_empty() {
-            let call_site = self.build_indirect_call(
+            let (call_site, llvm_func_type) = self.build_indirect_call_with_params(
                 ctx_ptr,
                 func_type,
                 func_ptr,
-                Some(G0M0FunctionKind::Local),
-                Some((g0_value.into_int_value(), m0)),
+                Some(m0),
+                is_return_call,
+                &params,
             )?;
 
-            self.abi
-                .rets_from_call(&self.builder, self.intrinsics, call_site, func_type)?
-                .iter()
-                .for_each(|ret| self.state.push1(*ret));
+            if is_return_call {
+                self.emit_return_call(call_site, llvm_func_type)?;
+            } else {
+                self.abi
+                    .rets_from_call(&self.builder, self.intrinsics, call_site, func_type)?
+                    .iter()
+                    .for_each(|ret| self.state.push1(*ret));
+            }
         } else {
-            let call_site = self.build_indirect_call(
+            let (call_site, llvm_func_type) = self.build_indirect_call_with_params(
                 ctx_ptr,
                 func_type,
                 func_ptr,
-                Some(G0M0FunctionKind::Imported),
-                Some((g0_value.into_int_value(), m0)),
+                None,
+                is_return_call,
+                &params,
             )?;
-            self.abi
-                .rets_from_call(&self.builder, self.intrinsics, call_site, func_type)?
-                .iter()
-                .for_each(|ret| self.state.push1(*ret));
+            if is_return_call {
+                self.emit_return_call(call_site, llvm_func_type)?;
+            } else {
+                self.abi
+                    .rets_from_call(&self.builder, self.intrinsics, call_site, func_type)?
+                    .iter()
+                    .for_each(|ret| self.state.push1(*ret));
+            }
         }
 
         Ok(())
@@ -1718,20 +2142,38 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
         ctx_ptr: PointerValue<'ctx>,
         func_type: &FunctionType,
         func_ptr: PointerValue<'ctx>,
-        func_kind: Option<G0M0FunctionKind>,
-        g0m0_params: LocalFunctionG0M0params<'ctx>,
-    ) -> Result<CallSiteValue<'ctx>, CompileError> {
+        m0_param: Option<PointerValue<'ctx>>,
+        is_return_call: bool,
+    ) -> Result<(CallSiteValue<'ctx>, inkwell::types::FunctionType<'ctx>), CompileError> {
+        let params = self.state.popn_save_extra(func_type.params().len())?;
+        self.build_indirect_call_with_params(
+            ctx_ptr,
+            func_type,
+            func_ptr,
+            m0_param,
+            is_return_call,
+            &params,
+        )
+    }
+
+    fn build_indirect_call_with_params(
+        &mut self,
+        ctx_ptr: PointerValue<'ctx>,
+        func_type: &FunctionType,
+        func_ptr: PointerValue<'ctx>,
+        m0_param: Option<PointerValue<'ctx>>,
+        is_return_call: bool,
+        params: &[(BasicValueEnum<'ctx>, ExtraInfo)],
+    ) -> Result<(CallSiteValue<'ctx>, inkwell::types::FunctionType<'ctx>), CompileError> {
         let (llvm_func_type, llvm_func_attrs) = self.abi.func_type_to_llvm(
             self.context,
             self.intrinsics,
             Some(self.ctx.get_offsets()),
             func_type,
-            func_kind,
+            m0_param.is_some(),
         )?;
 
-        let params = self.state.popn_save_extra(func_type.params().len())?;
-
-        // Apply pending canonicalizations.
+        // Apply pending canonicalization.
         let params = params
             .iter()
             .zip(func_type.params().iter())
@@ -1758,7 +2200,10 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             ctx_ptr,
             params.as_slice(),
             self.intrinsics,
-            g0m0_params,
+            m0_param,
+            is_return_call
+                .then(|| self.current_sret_ptr(func_type))
+                .flatten(),
         )?;
 
         let typed_func_ptr = err!(self.builder.build_pointer_cast(
@@ -1767,154 +2212,71 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             "typed_func_ptr",
         ));
 
-        /*
-        if self.track_state {
-            if let Some(offset) = opcode_offset {
-                let mut stackmaps = self.stackmaps.borrow_mut();
-                emit_stack_map(
-                    &info,
-                    self.intrinsics,
-                    self.builder,
-                    self.index,
-                    &mut *stackmaps,
-                    StackmapEntryKind::Call,
-                    &self.locals,
-                    state,
-                    ctx,
-                    offset,
-                )
-            }
+        let call_site_local = self.build_indirect_call_or_invoke(
+            llvm_func_type,
+            typed_func_ptr,
+            params.as_slice(),
+            "then_block",
+            is_return_call,
+        )?;
+        for (attr, attr_loc) in llvm_func_attrs {
+            call_site_local.add_attribute(attr_loc, attr);
         }
-        */
 
-        let call_site_local = if let Some(lpad) = self.state.get_innermost_landingpad() {
-            let then_block = self.context.append_basic_block(self.function, "then_block");
+        Ok((call_site_local, llvm_func_type))
+    }
+
+    fn build_indirect_call_or_invoke(
+        &mut self,
+        llvm_func_type: inkwell::types::FunctionType<'ctx>,
+        func_ptr: PointerValue<'ctx>,
+        params: &[BasicValueEnum<'ctx>],
+        then_block_name: &str,
+        is_return_call: bool,
+    ) -> Result<CallSiteValue<'ctx>, CompileError> {
+        // This is an unintuitive spec corner case: a tail call must bypass all enclosing
+        // try_table blocks in the function. See https://github.com/WebAssembly/exception-handling/issues/249.
+        if let Some(lpad) = self.state.get_innermost_landingpad()
+            && !is_return_call
+        {
+            let then_block = self
+                .context
+                .append_basic_block(self.function, then_block_name);
 
             let ret = err!(self.builder.build_indirect_invoke(
                 llvm_func_type,
-                typed_func_ptr,
-                params.as_slice(),
+                func_ptr,
+                params,
                 then_block,
                 lpad,
                 "",
             ));
 
             self.builder.position_at_end(then_block);
-            ret
+            Ok(ret)
         } else {
-            err!(
-                self.builder.build_indirect_call(
-                    llvm_func_type,
-                    typed_func_ptr,
-                    params
-                        .iter()
-                        .copied()
-                        .map(Into::into)
-                        .collect::<Vec<BasicMetadataValueEnum>>()
-                        .as_slice(),
-                    "indirect_call",
-                )
-            )
-        };
-        for (attr, attr_loc) in llvm_func_attrs {
-            call_site_local.add_attribute(attr_loc, attr);
+            let call_params = params
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect::<Vec<BasicMetadataValueEnum>>();
+            Ok(err!(self.builder.build_indirect_call(
+                llvm_func_type,
+                func_ptr,
+                call_params.as_slice(),
+                ""
+            )))
         }
-
-        Ok(call_site_local)
     }
 }
 
-/*
-fn emit_stack_map<'ctx>(
-    intrinsics: &Intrinsics<'ctx>,
-    builder: &Builder<'ctx>,
-    local_function_id: usize,
-    target: &mut StackmapRegistry,
-    kind: StackmapEntryKind,
-    locals: &[PointerValue],
-    state: &State<'ctx>,
-    _ctx: &mut CtxType<'ctx>,
-    opcode_offset: usize,
-) {
-    let stackmap_id = target.entries.len();
-
-    let mut params = Vec::with_capacity(2 + locals.len() + state.stack.len());
-
-    params.push(
-        intrinsics
-            .i64_ty
-            .const_int(stackmap_id as u64, false)
-            .as_basic_value_enum(),
-    );
-    params.push(intrinsics.i32_ty.const_zero().as_basic_value_enum());
-
-    let locals: Vec<_> = locals.iter().map(|x| x.as_basic_value_enum()).collect();
-    let mut value_semantics: Vec<ValueSemantic> =
-        Vec::with_capacity(locals.len() + state.stack.len());
-
-    params.extend_from_slice(&locals);
-    value_semantics.extend((0..locals.len()).map(ValueSemantic::WasmLocal));
-
-    params.extend(state.stack.iter().map(|x| x.0));
-    value_semantics.extend((0..state.stack.len()).map(ValueSemantic::WasmStack));
-
-    // FIXME: Information needed for Abstract -> Runtime state transform is not fully preserved
-    // to accelerate compilation and reduce memory usage. Check this again when we try to support
-    // "full" LLVM OSR.
-
-    assert_eq!(params.len(), value_semantics.len() + 2);
-
-    builder.build_call(intrinsics.experimental_stackmap, &params, "");
-
-    target.entries.push(StackmapEntry {
-        kind,
-        local_function_id,
-        local_count: locals.len(),
-        stack_count: state.stack.len(),
-        opcode_offset,
-        value_semantics,
-        is_start: true,
-    });
-}
-
-fn finalize_opcode_stack_map<'ctx>(
-    intrinsics: &Intrinsics<'ctx>,
-    builder: &Builder<'ctx>,
-    local_function_id: usize,
-    target: &mut StackmapRegistry,
-    kind: StackmapEntryKind,
-    opcode_offset: usize,
-) {
-    let stackmap_id = target.entries.len();
-    builder.build_call(
-        intrinsics.experimental_stackmap,
-        &[
-            intrinsics
-                .i64_ty
-                .const_int(stackmap_id as u64, false)
-                .as_basic_value_enum(),
-            intrinsics.i32_ty.const_zero().as_basic_value_enum(),
-        ],
-        "opcode_stack_map_end",
-    );
-    target.entries.push(StackmapEntry {
-        kind,
-        local_function_id,
-        local_count: 0,
-        stack_count: 0,
-        opcode_offset,
-        value_semantics: vec![],
-        is_start: false,
-    });
-}
- */
-
 pub struct LLVMFunctionCodeGenerator<'ctx, 'a> {
-    g0m0: Option<(PointerValue<'ctx>, PointerValue<'ctx>)>,
+    m0_param: Option<PointerValue<'ctx>>,
     context: &'ctx Context,
     builder: Builder<'ctx>,
     alloca_builder: Builder<'ctx>,
     intrinsics: &'a Intrinsics<'ctx>,
+    target_data: &'a TargetData,
     state: State<'ctx>,
     function: FunctionValue<'ctx>,
     locals: Vec<(BasicTypeEnum<'ctx>, PointerValue<'ctx>)>, // Contains params and locals
@@ -1922,62 +2284,265 @@ pub struct LLVMFunctionCodeGenerator<'ctx, 'a> {
     unreachable_depth: usize,
     memory_styles: &'a PrimaryMap<MemoryIndex, MemoryStyle>,
     _table_styles: &'a PrimaryMap<TableIndex, TableStyle>,
-
-    // This is support for stackmaps:
-    /*
-    stackmaps: Rc<RefCell<StackmapRegistry>>,
-    index: usize,
-    opcode_offset: usize,
-    track_state: bool,
-    */
     module: &'a Module<'ctx>,
     module_translation: &'a ModuleTranslationState,
+    signature_hashes: &'a PrimaryMap<SignatureIndex, SignatureHash>,
     wasm_module: &'a ModuleInfo,
     symbol_registry: &'a dyn SymbolRegistry,
     abi: &'a dyn Abi,
     config: &'a LLVM,
+    target_triple: Triple,
     tags_cache: HashMap<i32, BasicValueEnum<'ctx>>,
     binary_fmt: target_lexicon::BinaryFormat,
+    cpu_features: EnumSet<CpuFeature>,
+    non_volatile_memory_ops: bool,
 }
 
 impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
-    fn translate_operator(&mut self, op: Operator, _source_loc: u32) -> Result<(), CompileError> {
-        // TODO: remove this vmctx by moving everything into CtxType. Values
-        // computed off vmctx usually benefit from caching.
-        let vmctx = &self.ctx.basic().into_pointer_value();
+    fn quiet_nan(&self, value: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>, CompileError> {
+        let intrinsic = if value
+            .get_type()
+            .eq(&self.intrinsics.f32_ty.as_basic_type_enum())
+        {
+            Some(self.intrinsics.add_f32)
+        } else if value
+            .get_type()
+            .eq(&self.intrinsics.f64_ty.as_basic_type_enum())
+        {
+            Some(self.intrinsics.add_f64)
+        } else if value
+            .get_type()
+            .eq(&self.intrinsics.f32x4_ty.as_basic_type_enum())
+        {
+            Some(self.intrinsics.add_f32x4)
+        } else if value
+            .get_type()
+            .eq(&self.intrinsics.f64x2_ty.as_basic_type_enum())
+        {
+            Some(self.intrinsics.add_f64x2)
+        } else {
+            None
+        };
 
-        //let opcode_offset: Option<usize> = None;
-
-        if !self.state.reachable {
-            match op {
-                Operator::Block { blockty: _ }
-                | Operator::Loop { blockty: _ }
-                | Operator::If { blockty: _ } => {
-                    self.unreachable_depth += 1;
-                    return Ok(());
-                }
-                Operator::Else => {
-                    if self.unreachable_depth != 0 {
-                        return Ok(());
-                    }
-                }
-                Operator::End => {
-                    if self.unreachable_depth != 0 {
-                        self.unreachable_depth -= 1;
-                        return Ok(());
-                    }
-                }
-                _ => {
-                    return Ok(());
-                }
-            }
+        match intrinsic {
+            Some(intrinsic) => err_nt!(
+                self.builder
+                    .build_call(
+                        intrinsic,
+                        &[
+                            value.into(),
+                            value.get_type().const_zero().into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )
+                    .map(|v| v.try_as_basic_value().unwrap_basic())
+            ),
+            None => Ok(value),
         }
+    }
 
+    fn finalize_minmax_result(
+        &self,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, CompileError> {
+        let ty = value.get_type();
+        if ty.eq(&self.intrinsics.f32_ty.as_basic_type_enum())
+            || ty.eq(&self.intrinsics.f64_ty.as_basic_type_enum())
+        {
+            let value = value.into_float_value();
+            let is_nan = err!(self.builder.build_float_compare(
+                FloatPredicate::UNO,
+                value,
+                value,
+                "res_is_nan"
+            ));
+            let quiet = self.quiet_nan(value.as_basic_value_enum())?;
+            let result =
+                err!(
+                    self.builder
+                        .build_select(is_nan, quiet, value.as_basic_value_enum(), "")
+                );
+            Ok(result.as_basic_value_enum())
+        } else if ty.eq(&self.intrinsics.f32x4_ty.as_basic_type_enum()) {
+            let value = value.into_vector_value();
+            let is_nan = self
+                .build_call_with_param_attributes(
+                    self.intrinsics.cmp_f32x4,
+                    &[
+                        value.into(),
+                        value.into(),
+                        self.intrinsics.fp_uno_md,
+                        self.intrinsics.fp_exception_md,
+                    ],
+                    "",
+                )?
+                .try_as_basic_value()
+                .unwrap_basic()
+                .into_vector_value();
+            let quiet = self
+                .quiet_nan(value.as_basic_value_enum())?
+                .into_vector_value();
+            let result = err!(self.builder.build_select(
+                is_nan,
+                quiet.as_basic_value_enum(),
+                value.as_basic_value_enum(),
+                "",
+            ));
+            Ok(result.as_basic_value_enum())
+        } else if ty.eq(&self.intrinsics.f64x2_ty.as_basic_type_enum()) {
+            let value = value.into_vector_value();
+            let is_nan = self
+                .build_call_with_param_attributes(
+                    self.intrinsics.cmp_f64x2,
+                    &[
+                        value.into(),
+                        value.into(),
+                        self.intrinsics.fp_uno_md,
+                        self.intrinsics.fp_exception_md,
+                    ],
+                    "",
+                )?
+                .try_as_basic_value()
+                .unwrap_basic()
+                .into_vector_value();
+            let quiet = self
+                .quiet_nan(value.as_basic_value_enum())?
+                .into_vector_value();
+            let result = err!(self.builder.build_select(
+                is_nan,
+                quiet.as_basic_value_enum(),
+                value.as_basic_value_enum(),
+                "",
+            ));
+            Ok(result.as_basic_value_enum())
+        } else {
+            Ok(value)
+        }
+    }
+
+    fn finalize_rounding_result(
+        &self,
+        value: BasicValueEnum<'ctx>,
+        info: ExtraInfo,
+    ) -> Result<(BasicValueEnum<'ctx>, ExtraInfo), CompileError> {
+        let ty = value.get_type();
+        let is_f32 = ty.eq(&self.intrinsics.f32_ty.as_basic_type_enum());
+        let is_f64 = ty.eq(&self.intrinsics.f64_ty.as_basic_type_enum());
+        let is_f32x4 = ty.eq(&self.intrinsics.f32x4_ty.as_basic_type_enum());
+        let is_f64x2 = ty.eq(&self.intrinsics.f64x2_ty.as_basic_type_enum());
+        debug_assert!(is_f32 || is_f64 || is_f32x4 || is_f64x2);
+
+        if matches!(
+            self.target_triple.architecture,
+            Architecture::Riscv32(..) | Architecture::Riscv64(..)
+        ) {
+            if is_f32 || is_f64 {
+                let input = value.into_float_value();
+                let is_nan = err!(self.builder.build_float_compare(
+                    FloatPredicate::UNO,
+                    input,
+                    input,
+                    "res_is_nan",
+                ));
+                let canonical_nan_bits = if is_f32 {
+                    self.intrinsics
+                        .i32_ty
+                        .const_int(CANONICAL_NAN_F32 as _, false)
+                } else {
+                    self.intrinsics.i64_ty.const_int(CANONICAL_NAN_F64, false)
+                };
+                let canonical_nan = err!(self.builder.build_bit_cast(
+                    canonical_nan_bits,
+                    ty,
+                    "canonical_nan",
+                ));
+                let res =
+                    err!(
+                        self.builder
+                            .build_select(is_nan, canonical_nan, value, "canonical_nan",)
+                    );
+                Ok((res, info))
+            } else if is_f32x4 {
+                let value = value.into_vector_value();
+                let is_nan = err!(self.builder.build_call(
+                    self.intrinsics.cmp_f32x4,
+                    &[
+                        value.into(),
+                        value.into(),
+                        self.intrinsics.fp_uno_md,
+                        self.intrinsics.fp_exception_md,
+                    ],
+                    "",
+                ))
+                .try_as_basic_value()
+                .unwrap_basic()
+                .into_vector_value();
+                let canonical_nan_bits = self
+                    .intrinsics
+                    .i32_ty
+                    .const_int(CANONICAL_NAN_F32 as _, false);
+                let canonical_nan_bits = VectorType::const_vector(&[canonical_nan_bits; 4]);
+                let canonical_nan = err!(self.builder.build_bit_cast(
+                    canonical_nan_bits,
+                    self.intrinsics.f32x4_ty,
+                    "canonical_nan",
+                ));
+                let res = err!(self.builder.build_select(
+                    is_nan,
+                    canonical_nan.as_basic_value_enum(),
+                    value.as_basic_value_enum(),
+                    "canonical_nan",
+                ));
+                Ok((res, info))
+            } else {
+                let value = value.into_vector_value();
+                let is_nan = err!(self.builder.build_call(
+                    self.intrinsics.cmp_f64x2,
+                    &[
+                        value.into(),
+                        value.into(),
+                        self.intrinsics.fp_uno_md,
+                        self.intrinsics.fp_exception_md,
+                    ],
+                    "",
+                ))
+                .try_as_basic_value()
+                .unwrap_basic()
+                .into_vector_value();
+                let canonical_nan_bits = self.intrinsics.i64_ty.const_int(CANONICAL_NAN_F64, false);
+                let canonical_nan_bits = VectorType::const_vector(&[canonical_nan_bits; 2]);
+                let canonical_nan = err!(self.builder.build_bit_cast(
+                    canonical_nan_bits,
+                    self.intrinsics.f64x2_ty,
+                    "canonical_nan",
+                ));
+                let res = err!(self.builder.build_select(
+                    is_nan,
+                    canonical_nan.as_basic_value_enum(),
+                    value.as_basic_value_enum(),
+                    "canonical_nan",
+                ));
+                Ok((res, info))
+            }
+        } else {
+            Ok((
+                value,
+                (info
+                    | if is_f32 || is_f32x4 {
+                        ExtraInfo::pending_f32_nan()
+                    } else {
+                        ExtraInfo::pending_f64_nan()
+                    })?,
+            ))
+        }
+    }
+
+    // Control Flow instructions.
+    // https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#control-flow-instructions
+    fn translate_control_flow_operator(&mut self, op: Operator) -> Result<(), CompileError> {
         match op {
-            /***************************
-             * Control Flow instructions.
-             * https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#control-flow-instructions
-             ***************************/
             Operator::Block { blockty } => {
                 let current_block = self
                     .builder
@@ -2077,7 +2642,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 // For each result of the block we're branching to,
                 // pop a value off the value stack and load it into
                 // the corresponding phi.
-                for (phi, value) in phis.iter().zip(values.into_iter()) {
+                for (phi, value) in phis.iter().zip(values) {
                     phi.add_incoming(&[(&value, current_block)]);
                 }
 
@@ -2383,20 +2948,27 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
 
             Operator::Unreachable => {
-                err!(self.builder.build_call(
+                self.build_call_with_param_attributes(
                     self.intrinsics.throw_trap,
                     &[self.intrinsics.trap_unreachable.into()],
                     "throw",
-                ));
+                )?;
                 err!(self.builder.build_unreachable());
 
                 self.state.reachable = false;
             }
+            _ => unreachable!(),
+        }
 
-            /***************************
-             * Basic instructions.
-             * https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#basic-instructions
-             ***************************/
+        Ok(())
+    }
+
+    // Basic instructions.
+    // https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#basic-instructions
+    fn translate_basic_operator(&mut self, op: Operator) -> Result<(), CompileError> {
+        let vmctx = &self.ctx.basic().into_pointer_value();
+
+        match op {
             Operator::Nop => {
                 // Do nothing.
             }
@@ -2592,75 +3164,52 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
 
             Operator::GlobalGet { global_index } => {
-                if self.g0m0.is_some() && global_index == 0 {
-                    let Some((g0, _)) = self.g0m0 else {
-                        unreachable!()
-                    };
-
-                    // Removed with mem2reg.
-                    let value = err!(self.builder.build_load(self.intrinsics.i32_ty, g0, ""));
-
-                    self.state.push1(value);
-                } else {
-                    let global_index = GlobalIndex::from_u32(global_index);
-                    match self
-                        .ctx
-                        .global(global_index, self.intrinsics, self.module)?
-                    {
-                        GlobalCache::Const { value } => {
-                            self.state.push1(*value);
-                        }
-                        GlobalCache::Mut {
-                            ptr_to_value,
-                            value_type,
-                        } => {
-                            let value =
-                                err!(self.builder.build_load(*value_type, *ptr_to_value, ""));
-                            tbaa_label(
-                                self.module,
-                                self.intrinsics,
-                                format!("global {}", global_index.as_u32()),
-                                value.as_instruction_value().unwrap(),
-                            );
-                            self.state.push1(value);
-                        }
+                let global_index = GlobalIndex::from_u32(global_index);
+                match self
+                    .ctx
+                    .global(global_index, self.intrinsics, self.module)?
+                {
+                    GlobalCache::Const { value } => {
+                        self.state.push1(*value);
+                    }
+                    GlobalCache::Mut {
+                        ptr_to_value,
+                        value_type,
+                    } => {
+                        let value = err!(self.builder.build_load(*value_type, *ptr_to_value, ""));
+                        tbaa_label(
+                            self.module,
+                            self.intrinsics,
+                            format!("global {}", global_index.as_u32()),
+                            value.as_instruction_value().unwrap(),
+                        );
+                        self.state.push1(value);
                     }
                 }
             }
             Operator::GlobalSet { global_index } => {
-                if self.g0m0.is_some() && global_index == 0 {
-                    let Some((g0, _)) = self.g0m0 else {
-                        unreachable!()
-                    };
-                    let ptr_to_value = g0;
-                    let (value, info) = self.state.pop1_extra()?;
-                    let value = self.apply_pending_canonicalization(value, info)?;
-                    let store = err!(self.builder.build_store(ptr_to_value, value));
-                    tbaa_label(self.module, self.intrinsics, "global 0".to_string(), store);
-                } else {
-                    let global_index = GlobalIndex::from_u32(global_index);
-                    match self
-                        .ctx
-                        .global(global_index, self.intrinsics, self.module)?
-                    {
-                        GlobalCache::Const { value: _ } => {
-                            return Err(CompileError::Codegen(format!(
-                                "global.set on immutable global index {}",
-                                global_index.as_u32()
-                            )));
-                        }
-                        GlobalCache::Mut { ptr_to_value, .. } => {
-                            let ptr_to_value = *ptr_to_value;
-                            let (value, info) = self.state.pop1_extra()?;
-                            let value = self.apply_pending_canonicalization(value, info)?;
-                            let store = err!(self.builder.build_store(ptr_to_value, value));
-                            tbaa_label(
-                                self.module,
-                                self.intrinsics,
-                                format!("global {}", global_index.as_u32()),
-                                store,
-                            );
-                        }
+                let global_index = GlobalIndex::from_u32(global_index);
+                match self
+                    .ctx
+                    .global(global_index, self.intrinsics, self.module)?
+                {
+                    GlobalCache::Const { value: _ } => {
+                        return Err(CompileError::Codegen(format!(
+                            "global.set on immutable global index {}",
+                            global_index.as_u32()
+                        )));
+                    }
+                    GlobalCache::Mut { ptr_to_value, .. } => {
+                        let ptr_to_value = *ptr_to_value;
+                        let (value, info) = self.state.pop1_extra()?;
+                        let value = self.apply_pending_canonicalization(value, info)?;
+                        let store = err!(self.builder.build_store(ptr_to_value, value));
+                        tbaa_label(
+                            self.module,
+                            self.intrinsics,
+                            format!("global {}", global_index.as_u32()),
+                            store,
+                        );
                     }
                 }
             }
@@ -2675,7 +3224,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
 
                 // If the pending bits of v1 and v2 are the same, we can pass
                 // them along to the result. Otherwise, apply pending
-                // canonicalizations now.
+                // canonicalization now.
                 let (v1, i1, v2, i2) = if i1.has_pending_f32_nan() != i2.has_pending_f32_nan()
                     || i1.has_pending_f64_nan() != i2.has_pending_f64_nan()
                 {
@@ -2709,26 +3258,19 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 };
                 self.state.push1_extra(res, info);
             }
-            Operator::Call { function_index } => {
+            Operator::Call { function_index } | Operator::ReturnCall { function_index } => {
+                let is_return_call = matches!(op, Operator::ReturnCall { .. });
                 let func_index = FunctionIndex::from_u32(function_index);
                 let sigindex = &self.wasm_module.functions[func_index];
                 let func_type = &self.wasm_module.signatures[*sigindex];
-
-                let mut g0m0_params = None;
 
                 let FunctionCache {
                     func,
                     llvm_func_type,
                     vmctx: callee_vmctx,
+                    imported_include_m0_param,
                     attrs,
                 } = if let Some(local_func_index) = self.wasm_module.local_func_index(func_index) {
-                    if let Some((g0, m0)) = &self.g0m0 {
-                        // removed with mem2reg.
-                        let value = err!(self.builder.build_load(self.intrinsics.i32_ty, *g0, ""));
-
-                        g0m0_params = Some((value.into_int_value(), *m0));
-                    }
-
                     let function_name = self
                         .symbol_registry
                         .symbol_to_name(Symbol::LocalFunction(local_func_index));
@@ -2744,11 +3286,12 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                     )?
                 } else {
                     self.ctx
-                        .func(func_index, self.intrinsics, self.context, func_type)?
+                        .imported_func(func_index, self.intrinsics, self.context, func_type)?
                 };
                 let llvm_func_type = *llvm_func_type;
                 let func = *func;
                 let callee_vmctx = *callee_vmctx;
+                let imported_include_m0_param = *imported_include_m0_param;
                 let attrs = attrs.clone();
 
                 /*
@@ -2758,7 +3301,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 */
                 let params = self.state.popn_save_extra(func_type.params().len())?;
 
-                // Apply pending canonicalizations.
+                // Apply pending canonicalization.
                 let params = params
                     .iter()
                     .zip(func_type.params().iter())
@@ -2778,130 +3321,218 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
-                let params = self.abi.args_to_call(
-                    &self.alloca_builder,
-                    func_type,
-                    &llvm_func_type,
-                    callee_vmctx.into_pointer_value(),
-                    params.as_slice(),
-                    self.intrinsics,
-                    g0m0_params,
-                )?;
-
-                /*
-                if self.track_state {
-                    if let Some(offset) = opcode_offset {
-                        let mut stackmaps = self.stackmaps.borrow_mut();
-                        emit_stack_map(
-                            &info,
+                if let (Some(m0_param), Some(include_m0_param)) =
+                    (self.m0_param, imported_include_m0_param)
+                {
+                    /* For imported functions, we must be careful about when to include `g0_param`:
+                    imports from another Wasm module expect it, while host-function imports do not.
+                    We intentionally not leverage tail-calls for such function calls. */
+                    let (llvm_func_type_no_m0, llvm_func_attrs_no_m0) =
+                        self.abi.func_type_to_llvm(
+                            self.context,
                             self.intrinsics,
-                            self.builder,
-                            self.index,
-                            &mut *stackmaps,
-                            StackmapEntryKind::Call,
-                            &self.locals,
-                            state,
-                            ctx,
-                            offset,
-                        )
-                    }
-                }
-                */
-                let call_site = if let Some(lpad) = self.state.get_innermost_landingpad() {
-                    let then_block = self.context.append_basic_block(self.function, "then_block");
+                            Some(self.ctx.get_offsets()),
+                            func_type,
+                            false,
+                        )?;
+                    let params_with_m0 = self.abi.args_to_call(
+                        &self.alloca_builder,
+                        func_type,
+                        &llvm_func_type,
+                        callee_vmctx.into_pointer_value(),
+                        params.as_slice(),
+                        self.intrinsics,
+                        Some(m0_param),
+                        is_return_call
+                            .then(|| self.current_sret_ptr(func_type))
+                            .flatten(),
+                    )?;
+                    let params_no_m0 = self.abi.args_to_call(
+                        &self.alloca_builder,
+                        func_type,
+                        &llvm_func_type_no_m0,
+                        callee_vmctx.into_pointer_value(),
+                        params.as_slice(),
+                        self.intrinsics,
+                        None,
+                        is_return_call
+                            .then(|| self.current_sret_ptr(func_type))
+                            .flatten(),
+                    )?;
 
-                    let ret = err!(self.builder.build_indirect_invoke(
+                    let include_m0_call_block = self
+                        .context
+                        .append_basic_block(self.function, "call_block_with_m0");
+                    let skip_m0_call_block =
+                        self.context.append_basic_block(self.function, "call_block");
+                    let call_cont = self.context.append_basic_block(self.function, "call_cont");
+                    err!(self.builder.build_conditional_branch(
+                        include_m0_param,
+                        include_m0_call_block,
+                        skip_m0_call_block,
+                    ));
+
+                    self.builder.position_at_end(include_m0_call_block);
+                    let call_site_with_m0 = self.build_indirect_call_or_invoke(
+                        llvm_func_type,
+                        func,
+                        params_with_m0.as_slice(),
+                        "then_block_with_m0",
+                        is_return_call,
+                    )?;
+                    for (attr, attr_loc) in &attrs {
+                        call_site_with_m0.add_attribute(*attr_loc, *attr);
+                    }
+                    let rets_with_m0 = self.abi.rets_from_call(
+                        &self.builder,
+                        self.intrinsics,
+                        call_site_with_m0,
+                        func_type,
+                    )?;
+                    let with_m0_pred = self.builder.get_insert_block().ok_or_else(|| {
+                        CompileError::Codegen(
+                            "missing insertion block after call with m0".to_string(),
+                        )
+                    })?;
+                    err!(self.builder.build_unconditional_branch(call_cont));
+
+                    self.builder.position_at_end(skip_m0_call_block);
+                    let call_site_no_m0 = self.build_indirect_call_or_invoke(
+                        llvm_func_type_no_m0,
+                        func,
+                        params_no_m0.as_slice(),
+                        "then_block",
+                        is_return_call,
+                    )?;
+                    for (attr, attr_loc) in &llvm_func_attrs_no_m0 {
+                        call_site_no_m0.add_attribute(*attr_loc, *attr);
+                    }
+                    let rets_no_m0 = self.abi.rets_from_call(
+                        &self.builder,
+                        self.intrinsics,
+                        call_site_no_m0,
+                        func_type,
+                    )?;
+                    let no_m0_pred = self.builder.get_insert_block().ok_or_else(|| {
+                        CompileError::Codegen(
+                            "missing insertion block after call without m0".to_string(),
+                        )
+                    })?;
+                    err!(self.builder.build_unconditional_branch(call_cont));
+
+                    self.builder.position_at_end(call_cont);
+                    for i in 0..rets_with_m0.len() {
+                        let with_m0 = rets_with_m0[i];
+                        let no_m0 = rets_no_m0[i];
+                        let phi = err!(self.builder.build_phi(with_m0.get_type(), ""));
+                        phi.add_incoming(&[(&with_m0, with_m0_pred), (&no_m0, no_m0_pred)]);
+                        self.state.push1(phi.as_basic_value());
+                    }
+                } else {
+                    let params = self.abi.args_to_call(
+                        &self.alloca_builder,
+                        func_type,
+                        &llvm_func_type,
+                        callee_vmctx.into_pointer_value(),
+                        params.as_slice(),
+                        self.intrinsics,
+                        self.m0_param,
+                        if is_return_call {
+                            self.current_sret_ptr(func_type)
+                        } else {
+                            None
+                        },
+                    )?;
+
+                    let call_site = self.build_indirect_call_or_invoke(
                         llvm_func_type,
                         func,
                         params.as_slice(),
-                        then_block,
-                        lpad,
-                        "",
-                    ));
+                        "then_block",
+                        is_return_call,
+                    )?;
+                    for (attr, attr_loc) in attrs {
+                        call_site.add_attribute(attr_loc, attr);
+                    }
 
-                    self.builder.position_at_end(then_block);
-                    ret
-                } else {
-                    err!(
-                        self.builder.build_indirect_call(
-                            llvm_func_type,
-                            func,
-                            params
-                                .iter()
-                                .copied()
-                                .map(Into::into)
-                                .collect::<Vec<BasicMetadataValueEnum>>()
-                                .as_slice(),
-                            "",
-                        )
-                    )
-                };
-                for (attr, attr_loc) in attrs {
-                    call_site.add_attribute(attr_loc, attr);
-                }
-                /*
-                if self.track_state {
-                    if let Some(offset) = opcode_offset {
-                        let mut stackmaps = self.stackmaps.borrow_mut();
-                        finalize_opcode_stack_map(
-                            self.intrinsics,
-                            self.builder,
-                            self.index,
-                            &mut *stackmaps,
-                            StackmapEntryKind::Call,
-                            offset,
-                        )
+                    if is_return_call {
+                        self.emit_return_call(call_site, llvm_func_type)?;
+                        self.state.reachable = false;
+                    } else {
+                        self.abi
+                            .rets_from_call(&self.builder, self.intrinsics, call_site, func_type)?
+                            .iter()
+                            .for_each(|ret| self.state.push1(*ret));
                     }
                 }
-                */
-
-                self.abi
-                    .rets_from_call(&self.builder, self.intrinsics, call_site, func_type)?
-                    .iter()
-                    .for_each(|ret| self.state.push1(*ret));
             }
             Operator::CallIndirect {
                 type_index,
                 table_index,
+            }
+            | Operator::ReturnCallIndirect {
+                type_index,
+                table_index,
             } => {
+                let is_return_call = matches!(op, Operator::ReturnCallIndirect { .. });
                 let sigindex = SignatureIndex::from_u32(type_index);
+                let table_index = TableIndex::from_u32(table_index);
                 let func_type = &self.wasm_module.signatures[sigindex];
-                let expected_dynamic_sigindex =
-                    self.ctx
-                        .dynamic_sigindex(sigindex, self.intrinsics, self.module)?;
-                let (table_base, table_bound) = self.ctx.table(
-                    TableIndex::from_u32(table_index),
-                    self.intrinsics,
-                    self.module,
-                    &self.builder,
-                )?;
-                let func_index = self.state.pop1()?.into_int_value();
+                let table = self.wasm_module.tables.get(table_index).unwrap();
+                let local_fixed_funcref_table = self
+                    .wasm_module
+                    .local_table_index(table_index)
+                    .filter(|_| table.is_fixed_funcref_table());
+                let expected_signature_hash = self
+                    .intrinsics
+                    .i32_ty
+                    .const_int(u64::from(self.signature_hashes[sigindex].as_u32()), false);
 
-                let truncated_table_bounds = err!(self.builder.build_int_truncate(
-                    table_bound,
-                    self.intrinsics.i32_ty,
-                    "truncated_table_bounds",
-                ));
+                let func_index = self.state.pop1()?.into_int_value();
+                let generic_table = if local_fixed_funcref_table.is_none() {
+                    Some(self.ctx.table(
+                        table_index,
+                        self.intrinsics,
+                        self.module,
+                        &self.builder,
+                    )?)
+                } else {
+                    None
+                };
+
+                let table_bound = if local_fixed_funcref_table.is_some() {
+                    self.intrinsics
+                        .i32_ty
+                        .const_int(table.minimum.into(), false)
+                } else {
+                    let (_, table_bound) = *generic_table.as_ref().unwrap();
+                    err!(self.builder.build_int_truncate(
+                        table_bound,
+                        self.intrinsics.i32_ty,
+                        "truncated_table_bounds",
+                    ))
+                };
 
                 // First, check if the index is outside of the table bounds.
                 let index_in_bounds = err!(self.builder.build_int_compare(
                     IntPredicate::ULT,
                     func_index,
-                    truncated_table_bounds,
+                    table_bound,
                     "index_in_bounds",
                 ));
 
-                let index_in_bounds = err!(self.builder.build_call(
-                    self.intrinsics.expect_i1,
-                    &[
-                        index_in_bounds.into(),
-                        self.intrinsics.i1_ty.const_int(1, false).into(),
-                    ],
-                    "index_in_bounds_expect",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
+                let index_in_bounds = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.expect_i1,
+                        &[
+                            index_in_bounds.into(),
+                            self.intrinsics.i1_ty.const_int(1, false).into(),
+                        ],
+                        "index_in_bounds_expect",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic()
+                    .into_int_value();
 
                 let in_bounds_continue_block = self
                     .context
@@ -2915,69 +3546,99 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                     not_in_bounds_block,
                 ));
                 self.builder.position_at_end(not_in_bounds_block);
-                err!(self.builder.build_call(
+                self.build_call_with_param_attributes(
                     self.intrinsics.throw_trap,
                     &[self.intrinsics.trap_table_access_oob.into()],
                     "throw",
-                ));
+                )?;
                 err!(self.builder.build_unreachable());
                 self.builder.position_at_end(in_bounds_continue_block);
 
-                // We assume the table has the `funcref` (pointer to `anyfunc`)
-                // element type.
-                let casted_table_base = err!(self.builder.build_pointer_cast(
-                    table_base,
-                    self.context.ptr_type(AddressSpace::default()),
-                    "casted_table_base",
-                ));
+                let anyfunc_struct_ptr = if let Some(local_table_index) = local_fixed_funcref_table
+                {
+                    let anyfuncs = self.ctx.fixed_funcref_table_anyfuncs(
+                        local_table_index,
+                        self.intrinsics,
+                        &self.builder,
+                    )?;
+                    unsafe {
+                        err!(self.builder.build_in_bounds_gep(
+                            self.intrinsics.anyfunc_ty,
+                            anyfuncs,
+                            &[func_index],
+                            "anyfunc_struct_ptr",
+                        ))
+                    }
+                } else {
+                    let (table_base, _) = *generic_table.as_ref().unwrap();
 
-                let funcref_ptr = unsafe {
-                    err!(self.builder.build_in_bounds_gep(
+                    // We assume the table has the `funcref` (pointer to `anyfunc`)
+                    // element type.
+                    let casted_table_base = err!(self.builder.build_pointer_cast(
+                        table_base,
+                        self.context.ptr_type(AddressSpace::default()),
+                        "casted_table_base",
+                    ));
+
+                    let funcref_ptr = unsafe {
+                        err!(self.builder.build_in_bounds_gep(
+                            self.intrinsics.ptr_ty,
+                            casted_table_base,
+                            &[func_index],
+                            "funcref_ptr",
+                        ))
+                    };
+
+                    // a funcref (pointer to `anyfunc`)
+                    let anyfunc_struct_ptr = err!(self.builder.build_load(
                         self.intrinsics.ptr_ty,
-                        casted_table_base,
-                        &[func_index],
-                        "funcref_ptr",
+                        funcref_ptr,
+                        "anyfunc_struct_ptr",
                     ))
+                    .into_pointer_value();
+
+                    if !table.readonly {
+                        // trap if we're trying to call a null funcref
+                        let funcref_not_null = err!(
+                            self.builder
+                                .build_is_not_null(anyfunc_struct_ptr, "null_funcref_check")
+                        );
+
+                        let funcref_continue_deref_block = self
+                            .context
+                            .append_basic_block(self.function, "funcref_continue_deref_block");
+
+                        let funcref_is_null_block = self
+                            .context
+                            .append_basic_block(self.function, "funcref_is_null_block");
+                        err!(self.builder.build_conditional_branch(
+                            funcref_not_null,
+                            funcref_continue_deref_block,
+                            funcref_is_null_block,
+                        ));
+                        self.builder.position_at_end(funcref_is_null_block);
+                        self.build_call_with_param_attributes(
+                            self.intrinsics.throw_trap,
+                            &[self.intrinsics.trap_call_indirect_null.into()],
+                            "throw",
+                        )?;
+                        err!(self.builder.build_unreachable());
+                        self.builder.position_at_end(funcref_continue_deref_block);
+                    }
+
+                    anyfunc_struct_ptr
                 };
 
-                // a funcref (pointer to `anyfunc`)
-                let anyfunc_struct_ptr = err!(self.builder.build_load(
-                    self.intrinsics.ptr_ty,
-                    funcref_ptr,
-                    "anyfunc_struct_ptr",
-                ))
-                .into_pointer_value();
-
-                // trap if we're trying to call a null funcref
-                {
-                    let funcref_not_null = err!(
-                        self.builder
-                            .build_is_not_null(anyfunc_struct_ptr, "null funcref check")
-                    );
-
-                    let funcref_continue_deref_block = self
-                        .context
-                        .append_basic_block(self.function, "funcref_continue deref_block");
-
-                    let funcref_is_null_block = self
-                        .context
-                        .append_basic_block(self.function, "funcref_is_null_block");
-                    err!(self.builder.build_conditional_branch(
-                        funcref_not_null,
-                        funcref_continue_deref_block,
-                        funcref_is_null_block,
-                    ));
-                    self.builder.position_at_end(funcref_is_null_block);
-                    err!(self.builder.build_call(
-                        self.intrinsics.throw_trap,
-                        &[self.intrinsics.trap_call_indirect_null.into()],
-                        "throw",
-                    ));
-                    err!(self.builder.build_unreachable());
-                    self.builder.position_at_end(funcref_continue_deref_block);
-                }
-
                 // Load things from the anyfunc data structure.
+                let sig_hash_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        self.intrinsics.anyfunc_ty,
+                        anyfunc_struct_ptr,
+                        1,
+                        "sig_hash_ptr",
+                    )
+                    .unwrap();
                 let func_ptr_ptr = self
                     .builder
                     .build_struct_gep(
@@ -2987,25 +3648,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                         "func_ptr_ptr",
                     )
                     .unwrap();
-                let sigindex_ptr = self
-                    .builder
-                    .build_struct_gep(
-                        self.intrinsics.anyfunc_ty,
-                        anyfunc_struct_ptr,
-                        1,
-                        "sigindex_ptr",
-                    )
-                    .unwrap();
-                let ctx_ptr_ptr = self
-                    .builder
-                    .build_struct_gep(
-                        self.intrinsics.anyfunc_ty,
-                        anyfunc_struct_ptr,
-                        2,
-                        "ctx_ptr_ptr",
-                    )
-                    .unwrap();
-                let (func_ptr, found_dynamic_sigindex, ctx_ptr) = (
+                let (func_ptr, found_signature_hash) = (
                     err!(
                         self.builder
                             .build_load(self.intrinsics.ptr_ty, func_ptr_ptr, "func_ptr")
@@ -3013,13 +3656,9 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                     .into_pointer_value(),
                     err!(
                         self.builder
-                            .build_load(self.intrinsics.i32_ty, sigindex_ptr, "sigindex")
+                            .build_load(self.intrinsics.i32_ty, sig_hash_ptr, "sig_hash")
                     )
                     .into_int_value(),
-                    err!(
-                        self.builder
-                            .build_load(self.intrinsics.ptr_ty, ctx_ptr_ptr, "ctx_ptr")
-                    ),
                 );
 
                 // Next, check if the table element is initialized.
@@ -3029,87 +3668,120 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
 
                 // Next, check if the signature id is correct.
 
-                let sigindices_equal = err!(self.builder.build_int_compare(
+                let sig_hashes_equal = err!(self.builder.build_int_compare(
                     IntPredicate::EQ,
-                    expected_dynamic_sigindex,
-                    found_dynamic_sigindex,
-                    "sigindices_equal",
+                    expected_signature_hash,
+                    found_signature_hash,
+                    "sig_hashes_equal",
                 ));
 
-                let initialized_and_sigindices_match = err!(self.builder.build_and(
+                let initialized_and_sig_hashes_match = err!(self.builder.build_and(
                     elem_initialized,
-                    sigindices_equal,
+                    sig_hashes_equal,
                     ""
                 ));
 
-                // Tell llvm that `expected_dynamic_sigindex` should equal `found_dynamic_sigindex`.
-                let initialized_and_sigindices_match = err!(self.builder.build_call(
-                    self.intrinsics.expect_i1,
-                    &[
-                        initialized_and_sigindices_match.into(),
-                        self.intrinsics.i1_ty.const_int(1, false).into(),
-                    ],
-                    "initialized_and_sigindices_match_expect",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
+                // Tell llvm that the expected and found signature hashes should match.
+                let initialized_and_sig_hashes_match = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.expect_i1,
+                        &[
+                            initialized_and_sig_hashes_match.into(),
+                            self.intrinsics.i1_ty.const_int(1, false).into(),
+                        ],
+                        "initialized_and_sig_hashes_match_expect",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic()
+                    .into_int_value();
 
                 let continue_block = self
                     .context
                     .append_basic_block(self.function, "continue_block");
-                let sigindices_notequal_block = self
+                let sighashes_notequal_block = self
                     .context
-                    .append_basic_block(self.function, "sigindices_notequal_block");
+                    .append_basic_block(self.function, "sighashes_notequal_block");
                 err!(self.builder.build_conditional_branch(
-                    initialized_and_sigindices_match,
+                    initialized_and_sig_hashes_match,
                     continue_block,
-                    sigindices_notequal_block,
+                    sighashes_notequal_block,
                 ));
 
-                self.builder.position_at_end(sigindices_notequal_block);
+                self.builder.position_at_end(sighashes_notequal_block);
                 let trap_code = err!(self.builder.build_select(
                     elem_initialized,
                     self.intrinsics.trap_call_indirect_sig,
                     self.intrinsics.trap_call_indirect_null,
                     "",
                 ));
-                err!(self.builder.build_call(
+                self.build_call_with_param_attributes(
                     self.intrinsics.throw_trap,
                     &[trap_code.into()],
-                    "throw"
-                ));
+                    "throw",
+                )?;
                 err!(self.builder.build_unreachable());
                 self.builder.position_at_end(continue_block);
 
-                if self.g0m0.is_some() {
-                    self.build_g0m0_indirect_call(
-                        table_index,
-                        ctx_ptr.into_pointer_value(),
+                let callee_vmctx = if table.readonly {
+                    *vmctx
+                } else {
+                    let ctx_ptr_ptr = self
+                        .builder
+                        .build_struct_gep(
+                            self.intrinsics.anyfunc_ty,
+                            anyfunc_struct_ptr,
+                            2,
+                            "ctx_ptr_ptr",
+                        )
+                        .unwrap();
+                    err!(
+                        self.builder
+                            .build_load(self.intrinsics.ptr_ty, ctx_ptr_ptr, "ctx_ptr")
+                    )
+                    .into_pointer_value()
+                };
+
+                if self.m0_param.is_some() {
+                    self.build_m0_indirect_call(
+                        table_index.as_u32(),
+                        callee_vmctx,
                         func_type,
                         func_ptr,
                         func_index,
+                        is_return_call,
                     )?;
                 } else {
-                    let call_site = self.build_indirect_call(
-                        ctx_ptr.into_pointer_value(),
+                    let (call_site, llvm_func_type) = self.build_indirect_call(
+                        callee_vmctx,
                         func_type,
                         func_ptr,
                         None,
-                        None,
+                        is_return_call,
                     )?;
 
-                    self.abi
-                        .rets_from_call(&self.builder, self.intrinsics, call_site, func_type)?
-                        .iter()
-                        .for_each(|ret| self.state.push1(*ret));
+                    if is_return_call {
+                        self.emit_return_call(call_site, llvm_func_type)?;
+                    } else {
+                        self.abi
+                            .rets_from_call(&self.builder, self.intrinsics, call_site, func_type)?
+                            .iter()
+                            .for_each(|ret| self.state.push1(*ret));
+                    }
+                }
+
+                if is_return_call {
+                    self.state.reachable = false;
                 }
             }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
 
-            /***************************
-             * Integer Arithmetic instructions.
-             * https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#integer-arithmetic-instructions
-             ***************************/
+    // Integer Arithmetic instructions.
+    // https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#integer-arithmetic-instructions
+    fn translate_integer_arithmetic_operator(&mut self, op: Operator) -> Result<(), CompileError> {
+        match op {
             Operator::I32Add | Operator::I64Add => {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let v1 = self.apply_pending_canonicalization(v1, i1)?;
@@ -3264,13 +3936,14 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, _) = self.v128_into_i8x16(v1, i1)?;
                 let (v2, _) = self.v128_into_i8x16(v2, i2)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.sadd_sat_i8x16,
-                    &[v1.into(), v2.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.sadd_sat_i8x16,
+                        &[v1.into(), v2.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -3281,13 +3954,14 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, _) = self.v128_into_i16x8(v1, i1)?;
                 let (v2, _) = self.v128_into_i16x8(v2, i2)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.sadd_sat_i16x8,
-                    &[v1.into(), v2.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.sadd_sat_i16x8,
+                        &[v1.into(), v2.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -3298,13 +3972,14 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, _) = self.v128_into_i8x16(v1, i1)?;
                 let (v2, _) = self.v128_into_i8x16(v2, i2)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.uadd_sat_i8x16,
-                    &[v1.into(), v2.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.uadd_sat_i8x16,
+                        &[v1.into(), v2.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -3315,13 +3990,14 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, _) = self.v128_into_i16x8(v1, i1)?;
                 let (v2, _) = self.v128_into_i16x8(v2, i2)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.uadd_sat_i16x8,
-                    &[v1.into(), v2.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.uadd_sat_i16x8,
+                        &[v1.into(), v2.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -3384,13 +4060,14 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, _) = self.v128_into_i8x16(v1, i1)?;
                 let (v2, _) = self.v128_into_i8x16(v2, i2)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.ssub_sat_i8x16,
-                    &[v1.into(), v2.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.ssub_sat_i8x16,
+                        &[v1.into(), v2.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -3401,13 +4078,14 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, _) = self.v128_into_i16x8(v1, i1)?;
                 let (v2, _) = self.v128_into_i16x8(v2, i2)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.ssub_sat_i16x8,
-                    &[v1.into(), v2.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.ssub_sat_i16x8,
+                        &[v1.into(), v2.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -3418,13 +4096,14 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, _) = self.v128_into_i8x16(v1, i1)?;
                 let (v2, _) = self.v128_into_i8x16(v2, i2)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.usub_sat_i8x16,
-                    &[v1.into(), v2.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.usub_sat_i8x16,
+                        &[v1.into(), v2.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -3435,13 +4114,14 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, _) = self.v128_into_i16x8(v1, i1)?;
                 let (v2, _) = self.v128_into_i16x8(v2, i2)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.usub_sat_i16x8,
-                    &[v1.into(), v2.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.usub_sat_i16x8,
+                        &[v1.into(), v2.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -3489,7 +4169,25 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 );
                 self.state.push1(res);
             }
-            Operator::I16x8Q15MulrSatS => {
+            Operator::I16x8RelaxedQ15mulrS if self.cpu_features.contains(CpuFeature::SSSE3) => {
+                let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
+                let (v1, _) = self.v128_into_i16x8(v1, i1)?;
+                let (v2, _) = self.v128_into_i16x8(v2, i2)?;
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.x86_64.pmulhrsw128,
+                        &[v1.into(), v2.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
+                );
+                self.state.push1(res);
+            }
+            Operator::I16x8Q15MulrSatS | Operator::I16x8RelaxedQ15mulrS => {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, _) = self.v128_into_i16x8(v1, i1)?;
                 let (v2, _) = self.v128_into_i16x8(v2, i2)?;
@@ -3562,22 +4260,22 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let shuffle_array = match op {
                     Operator::I16x8ExtMulLowI8x16S | Operator::I16x8ExtMulLowI8x16U => [
                         self.intrinsics.i32_consts[0],
+                        self.intrinsics.i32_consts[1],
                         self.intrinsics.i32_consts[2],
+                        self.intrinsics.i32_consts[3],
                         self.intrinsics.i32_consts[4],
+                        self.intrinsics.i32_consts[5],
                         self.intrinsics.i32_consts[6],
-                        self.intrinsics.i32_consts[8],
-                        self.intrinsics.i32_consts[10],
-                        self.intrinsics.i32_consts[12],
-                        self.intrinsics.i32_consts[14],
+                        self.intrinsics.i32_consts[7],
                     ],
                     Operator::I16x8ExtMulHighI8x16S | Operator::I16x8ExtMulHighI8x16U => [
-                        self.intrinsics.i32_consts[1],
-                        self.intrinsics.i32_consts[3],
-                        self.intrinsics.i32_consts[5],
-                        self.intrinsics.i32_consts[7],
+                        self.intrinsics.i32_consts[8],
                         self.intrinsics.i32_consts[9],
+                        self.intrinsics.i32_consts[10],
                         self.intrinsics.i32_consts[11],
+                        self.intrinsics.i32_consts[12],
                         self.intrinsics.i32_consts[13],
+                        self.intrinsics.i32_consts[14],
                         self.intrinsics.i32_consts[15],
                     ],
                     _ => unreachable!("Unhandled internal variant"),
@@ -3622,14 +4320,14 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let shuffle_array = match op {
                     Operator::I32x4ExtMulLowI16x8S | Operator::I32x4ExtMulLowI16x8U => [
                         self.intrinsics.i32_consts[0],
+                        self.intrinsics.i32_consts[1],
                         self.intrinsics.i32_consts[2],
-                        self.intrinsics.i32_consts[4],
-                        self.intrinsics.i32_consts[6],
+                        self.intrinsics.i32_consts[3],
                     ],
                     Operator::I32x4ExtMulHighI16x8S | Operator::I32x4ExtMulHighI16x8U => [
-                        self.intrinsics.i32_consts[1],
-                        self.intrinsics.i32_consts[3],
+                        self.intrinsics.i32_consts[4],
                         self.intrinsics.i32_consts[5],
+                        self.intrinsics.i32_consts[6],
                         self.intrinsics.i32_consts[7],
                     ],
                     _ => unreachable!("Unhandled internal variant"),
@@ -3673,10 +4371,10 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 };
                 let shuffle_array = match op {
                     Operator::I64x2ExtMulLowI32x4S | Operator::I64x2ExtMulLowI32x4U => {
-                        [self.intrinsics.i32_consts[0], self.intrinsics.i32_consts[2]]
+                        [self.intrinsics.i32_consts[0], self.intrinsics.i32_consts[1]]
                     }
                     Operator::I64x2ExtMulHighI32x4S | Operator::I64x2ExtMulHighI32x4U => {
-                        [self.intrinsics.i32_consts[1], self.intrinsics.i32_consts[3]]
+                        [self.intrinsics.i32_consts[2], self.intrinsics.i32_consts[3]]
                     }
                     _ => unreachable!("Unhandled internal variant"),
                 };
@@ -3768,6 +4466,263 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let high_product = err!(self.builder.build_int_mul(v1_high, v2_high, ""));
 
                 let res = err!(self.builder.build_int_add(low_product, high_product, ""));
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
+                );
+                self.state.push1(res);
+            }
+            Operator::I16x8RelaxedDotI8x16I7x16S
+                if self.cpu_features.contains(CpuFeature::SSSE3) =>
+            {
+                let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
+                let (a, _) = self.v128_into_i8x16(v1, i1)?;
+                let (b, _) = self.v128_into_i8x16(v2, i2)?;
+
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.x86_64.pmaddubsw128,
+                        &[b.into(), a.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic()
+                    .into_vector_value();
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
+                );
+                self.state.push1(res);
+            }
+            Operator::I16x8RelaxedDotI8x16I7x16S => {
+                let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
+                let (v1, _) = self.v128_into_i8x16(v1, i1)?;
+                let (v2, _) = self.v128_into_i8x16(v2, i2)?;
+
+                let left_indices = [
+                    self.intrinsics.i32_consts[0],
+                    self.intrinsics.i32_consts[2],
+                    self.intrinsics.i32_consts[4],
+                    self.intrinsics.i32_consts[6],
+                    self.intrinsics.i32_consts[8],
+                    self.intrinsics.i32_consts[10],
+                    self.intrinsics.i32_consts[12],
+                    self.intrinsics.i32_consts[14],
+                ];
+                let right_indices = [
+                    self.intrinsics.i32_consts[1],
+                    self.intrinsics.i32_consts[3],
+                    self.intrinsics.i32_consts[5],
+                    self.intrinsics.i32_consts[7],
+                    self.intrinsics.i32_consts[9],
+                    self.intrinsics.i32_consts[11],
+                    self.intrinsics.i32_consts[13],
+                    self.intrinsics.i32_consts[15],
+                ];
+
+                let v1_left = err!(self.builder.build_shuffle_vector(
+                    v1,
+                    v1.get_type().get_undef(),
+                    VectorType::const_vector(&left_indices),
+                    "",
+                ));
+                let v1_left = err!(self.builder.build_int_s_extend(
+                    v1_left,
+                    self.intrinsics.i16x8_ty,
+                    ""
+                ));
+                let v1_right = err!(self.builder.build_shuffle_vector(
+                    v1,
+                    v1.get_type().get_undef(),
+                    VectorType::const_vector(&right_indices),
+                    "",
+                ));
+                let v1_right = err!(self.builder.build_int_s_extend(
+                    v1_right,
+                    self.intrinsics.i16x8_ty,
+                    ""
+                ));
+
+                let v2_left = err!(self.builder.build_shuffle_vector(
+                    v2,
+                    v2.get_type().get_undef(),
+                    VectorType::const_vector(&left_indices),
+                    "",
+                ));
+                let v2_left = err!(self.builder.build_int_s_extend(
+                    v2_left,
+                    self.intrinsics.i16x8_ty,
+                    ""
+                ));
+                let v2_right = err!(self.builder.build_shuffle_vector(
+                    v2,
+                    v2.get_type().get_undef(),
+                    VectorType::const_vector(&right_indices),
+                    "",
+                ));
+                let v2_right = err!(self.builder.build_int_s_extend(
+                    v2_right,
+                    self.intrinsics.i16x8_ty,
+                    ""
+                ));
+
+                let prod_left = err!(self.builder.build_int_mul(v1_left, v2_left, ""));
+                let prod_right = err!(self.builder.build_int_mul(v1_right, v2_right, ""));
+                let res = err!(self.builder.build_int_add(prod_left, prod_right, ""));
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
+                );
+                self.state.push1(res);
+            }
+            Operator::I32x4RelaxedDotI8x16I7x16AddS
+                if self.cpu_features.contains(CpuFeature::SSSE3) =>
+            {
+                let ((v1, i1), (v2, i2), (acc, acc_info)) = self.state.pop3_extra()?;
+                let (v1, _) = self.v128_into_i8x16(v1, i1)?;
+                let (v2, _) = self.v128_into_i8x16(v2, i2)?;
+                let (acc, _) = self.v128_into_i32x4(acc, acc_info)?;
+
+                // PMADDUBSW computes pairwise u8*i8 with i16 saturation, which
+                // is one of the valid relaxed dot-product behaviors.
+                let dot16 = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.x86_64.pmaddubsw128,
+                        &[v2.into(), v1.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic()
+                    .into_vector_value();
+                let ones =
+                    VectorType::const_vector(&[self.intrinsics.i16_ty.const_int(1, false); 8]);
+                let dot32 = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.x86_64.pmaddwd128,
+                        &[dot16.into(), ones.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic()
+                    .into_vector_value();
+                let res = err!(self.builder.build_int_add(dot32, acc, ""));
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
+                );
+                self.state.push1(res);
+            }
+            Operator::I32x4RelaxedDotI8x16I7x16AddS => {
+                let ((v1, i1), (v2, i2), (acc, acc_info)) = self.state.pop3_extra()?;
+                let (v1, _) = self.v128_into_i8x16(v1, i1)?;
+                let (v2, _) = self.v128_into_i8x16(v2, i2)?;
+                let (acc, _) = self.v128_into_i32x4(acc, acc_info)?;
+
+                let left_indices = [
+                    self.intrinsics.i32_consts[0],
+                    self.intrinsics.i32_consts[2],
+                    self.intrinsics.i32_consts[4],
+                    self.intrinsics.i32_consts[6],
+                    self.intrinsics.i32_consts[8],
+                    self.intrinsics.i32_consts[10],
+                    self.intrinsics.i32_consts[12],
+                    self.intrinsics.i32_consts[14],
+                ];
+                let right_indices = [
+                    self.intrinsics.i32_consts[1],
+                    self.intrinsics.i32_consts[3],
+                    self.intrinsics.i32_consts[5],
+                    self.intrinsics.i32_consts[7],
+                    self.intrinsics.i32_consts[9],
+                    self.intrinsics.i32_consts[11],
+                    self.intrinsics.i32_consts[13],
+                    self.intrinsics.i32_consts[15],
+                ];
+
+                let v1_left = err!(self.builder.build_shuffle_vector(
+                    v1,
+                    v1.get_type().get_undef(),
+                    VectorType::const_vector(&left_indices),
+                    "",
+                ));
+                let v1_left = err!(self.builder.build_int_s_extend(
+                    v1_left,
+                    self.intrinsics.i16x8_ty,
+                    ""
+                ));
+                let v1_right = err!(self.builder.build_shuffle_vector(
+                    v1,
+                    v1.get_type().get_undef(),
+                    VectorType::const_vector(&right_indices),
+                    "",
+                ));
+                let v1_right = err!(self.builder.build_int_s_extend(
+                    v1_right,
+                    self.intrinsics.i16x8_ty,
+                    ""
+                ));
+
+                let v2_left = err!(self.builder.build_shuffle_vector(
+                    v2,
+                    v2.get_type().get_undef(),
+                    VectorType::const_vector(&left_indices),
+                    "",
+                ));
+                let v2_left = err!(self.builder.build_int_s_extend(
+                    v2_left,
+                    self.intrinsics.i16x8_ty,
+                    ""
+                ));
+                let v2_right = err!(self.builder.build_shuffle_vector(
+                    v2,
+                    v2.get_type().get_undef(),
+                    VectorType::const_vector(&right_indices),
+                    "",
+                ));
+                let v2_right = err!(self.builder.build_int_s_extend(
+                    v2_right,
+                    self.intrinsics.i16x8_ty,
+                    ""
+                ));
+
+                let prod_left = err!(self.builder.build_int_mul(v1_left, v2_left, ""));
+                let prod_right = err!(self.builder.build_int_mul(v1_right, v2_right, ""));
+                let dot16 = err!(self.builder.build_int_add(prod_left, prod_right, ""));
+
+                let pair_left = err!(self.builder.build_shuffle_vector(
+                    dot16,
+                    dot16.get_type().get_undef(),
+                    VectorType::const_vector(&[
+                        self.intrinsics.i32_consts[0],
+                        self.intrinsics.i32_consts[2],
+                        self.intrinsics.i32_consts[4],
+                        self.intrinsics.i32_consts[6],
+                    ]),
+                    "",
+                ));
+                let pair_left = err!(self.builder.build_int_s_extend(
+                    pair_left,
+                    self.intrinsics.i32x4_ty,
+                    ""
+                ));
+                let pair_right = err!(self.builder.build_shuffle_vector(
+                    dot16,
+                    dot16.get_type().get_undef(),
+                    VectorType::const_vector(&[
+                        self.intrinsics.i32_consts[1],
+                        self.intrinsics.i32_consts[3],
+                        self.intrinsics.i32_consts[5],
+                        self.intrinsics.i32_consts[7],
+                    ]),
+                    "",
+                ));
+                let pair_right = err!(self.builder.build_int_s_extend(
+                    pair_right,
+                    self.intrinsics.i32x4_ty,
+                    ""
+                ));
+                let dot32 = err!(self.builder.build_int_add(pair_left, pair_right, ""));
+                let res = err!(self.builder.build_int_add(dot32, acc, ""));
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -3895,7 +4850,39 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let res = err!(self.builder.build_and(v1, v2, ""));
                 self.state.push1(res);
             }
-            Operator::V128Bitselect => {
+            Operator::I8x16RelaxedLaneselect
+            | Operator::I16x8RelaxedLaneselect
+            | Operator::I32x4RelaxedLaneselect
+            | Operator::I64x2RelaxedLaneselect
+                if self.cpu_features.contains(CpuFeature::SSE41) =>
+            {
+                let ((v1, i1), (v2, i2), (mask, mask_info)) = self.state.pop3_extra()?;
+                let v1 = self.apply_pending_canonicalization(v1, i1)?;
+                let v2 = self.apply_pending_canonicalization(v2, i2)?;
+                let mask = self.apply_pending_canonicalization(mask, mask_info)?;
+
+                let (v1, _) = self.v128_into_i8x16(v1, i1)?;
+                let (v2, _) = self.v128_into_i8x16(v2, i2)?;
+                let (mask, _) = self.v128_into_i8x16(mask, mask_info)?;
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.x86_64.pblendvb,
+                        &[v2.into(), v1.into(), mask.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
+                );
+                self.state.push1(res);
+            }
+            Operator::I8x16RelaxedLaneselect
+            | Operator::I16x8RelaxedLaneselect
+            | Operator::I32x4RelaxedLaneselect
+            | Operator::I64x2RelaxedLaneselect
+            | Operator::V128Bitselect => {
                 let ((v1, i1), (v2, i2), (cond, cond_info)) = self.state.pop3_extra()?;
                 let v1 = self.apply_pending_canonicalization(v1, i1)?;
                 let v2 = self.apply_pending_canonicalization(v2, i2)?;
@@ -4364,64 +5351,65 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let (input, info) = self.state.pop1_extra()?;
                 let input = self.apply_pending_canonicalization(input, info)?;
                 let is_zero_undef = self.intrinsics.i1_zero;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.ctlz_i32,
-                    &[input.into(), is_zero_undef.into()],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.ctlz_i32,
+                        &[input.into(), is_zero_undef.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(res, ExtraInfo::arithmetic_f32());
             }
             Operator::I64Clz => {
                 let (input, info) = self.state.pop1_extra()?;
                 let input = self.apply_pending_canonicalization(input, info)?;
                 let is_zero_undef = self.intrinsics.i1_zero;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.ctlz_i64,
-                    &[input.into(), is_zero_undef.into()],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.ctlz_i64,
+                        &[input.into(), is_zero_undef.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(res, ExtraInfo::arithmetic_f64());
             }
             Operator::I32Ctz => {
                 let (input, info) = self.state.pop1_extra()?;
                 let input = self.apply_pending_canonicalization(input, info)?;
                 let is_zero_undef = self.intrinsics.i1_zero;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.cttz_i32,
-                    &[input.into(), is_zero_undef.into()],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.cttz_i32,
+                        &[input.into(), is_zero_undef.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(res, ExtraInfo::arithmetic_f32());
             }
             Operator::I64Ctz => {
                 let (input, info) = self.state.pop1_extra()?;
                 let input = self.apply_pending_canonicalization(input, info)?;
                 let is_zero_undef = self.intrinsics.i1_zero;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.cttz_i64,
-                    &[input.into(), is_zero_undef.into()],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.cttz_i64,
+                        &[input.into(), is_zero_undef.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(res, ExtraInfo::arithmetic_f64());
             }
             Operator::I8x16Popcnt => {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, _) = self.v128_into_i8x16(v, i)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.ctpop_i8x16,
-                    &[v.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(self.intrinsics.ctpop_i8x16, &[v.into()], "")?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -4431,25 +5419,27 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             Operator::I32Popcnt => {
                 let (input, info) = self.state.pop1_extra()?;
                 let input = self.apply_pending_canonicalization(input, info)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.ctpop_i32,
-                    &[input.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.ctpop_i32,
+                        &[input.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(res, ExtraInfo::arithmetic_f32());
             }
             Operator::I64Popcnt => {
                 let (input, info) = self.state.pop1_extra()?;
                 let input = self.apply_pending_canonicalization(input, info)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.ctpop_i64,
-                    &[input.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.ctpop_i64,
+                        &[input.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(res, ExtraInfo::arithmetic_f64());
             }
             Operator::I32Eqz => {
@@ -4794,25 +5784,137 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 );
                 self.state.push1(res);
             }
+            Operator::I64Add128 | Operator::I64Sub128 => {
+                let (rhs_hi, rhs_hi_info) = self.state.pop1_extra()?;
+                let (rhs_lo, rhs_lo_info) = self.state.pop1_extra()?;
+                let (lhs_hi, lhs_hi_info) = self.state.pop1_extra()?;
+                let (lhs_lo, lhs_lo_info) = self.state.pop1_extra()?;
 
-            /***************************
-             * Floating-Point Arithmetic instructions.
-             * https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#floating-point-arithmetic-instructions
-             ***************************/
+                let lhs_lo = self
+                    .apply_pending_canonicalization(lhs_lo, lhs_lo_info)?
+                    .into_int_value();
+                let lhs_hi = self
+                    .apply_pending_canonicalization(lhs_hi, lhs_hi_info)?
+                    .into_int_value();
+                let rhs_lo = self
+                    .apply_pending_canonicalization(rhs_lo, rhs_lo_info)?
+                    .into_int_value();
+                let rhs_hi = self
+                    .apply_pending_canonicalization(rhs_hi, rhs_hi_info)?
+                    .into_int_value();
+
+                let idx0 = self.intrinsics.i32_ty.const_zero();
+                let idx1 = self.intrinsics.i32_ty.const_int(1, false);
+
+                let lhs = self.intrinsics.i64x2_ty.get_undef();
+                let lhs = err!(self.builder.build_insert_element(lhs, lhs_lo, idx0, ""));
+                let lhs = err!(self.builder.build_insert_element(lhs, lhs_hi, idx1, ""));
+                let lhs = err!(
+                    self.builder
+                        .build_bit_cast(lhs, self.intrinsics.i128_ty, "a")
+                )
+                .into_int_value();
+
+                let rhs = self.intrinsics.i64x2_ty.get_undef();
+                let rhs = err!(self.builder.build_insert_element(rhs, rhs_lo, idx0, ""));
+                let rhs = err!(self.builder.build_insert_element(rhs, rhs_hi, idx1, ""));
+                let rhs = err!(
+                    self.builder
+                        .build_bit_cast(rhs, self.intrinsics.i128_ty, "b")
+                )
+                .into_int_value();
+
+                let result = err!(match op {
+                    Operator::I64Add128 => self.builder.build_int_add(lhs, rhs, ""),
+                    Operator::I64Sub128 => self.builder.build_int_sub(lhs, rhs, ""),
+                    _ => unreachable!(),
+                });
+                let result = err!(self.builder.build_bit_cast(
+                    result,
+                    self.intrinsics.i64x2_ty,
+                    ""
+                ))
+                .into_vector_value();
+                let result_lo = err!(self.builder.build_extract_element(result, idx0, ""));
+                let result_hi = err!(self.builder.build_extract_element(result, idx1, ""));
+
+                self.state.push1(result_lo);
+                self.state.push1(result_hi);
+            }
+            Operator::I64MulWideS | Operator::I64MulWideU => {
+                let ((lhs, lhs_info), (rhs, rhs_info)) = self.state.pop2_extra()?;
+                let lhs = self
+                    .apply_pending_canonicalization(lhs, lhs_info)?
+                    .into_int_value();
+                let rhs = self
+                    .apply_pending_canonicalization(rhs, rhs_info)?
+                    .into_int_value();
+
+                let lhs = err!(match op {
+                    Operator::I64MulWideS => {
+                        self.builder
+                            .build_int_s_extend(lhs, self.intrinsics.i128_ty, "a")
+                    }
+                    Operator::I64MulWideU => {
+                        self.builder
+                            .build_int_z_extend(lhs, self.intrinsics.i128_ty, "a")
+                    }
+                    _ => unreachable!(),
+                });
+                let rhs = err!(match op {
+                    Operator::I64MulWideS => {
+                        self.builder
+                            .build_int_s_extend(rhs, self.intrinsics.i128_ty, "b")
+                    }
+                    Operator::I64MulWideU => {
+                        self.builder
+                            .build_int_z_extend(rhs, self.intrinsics.i128_ty, "b")
+                    }
+                    _ => unreachable!(),
+                });
+
+                let result = err!(self.builder.build_int_mul(lhs, rhs, ""));
+                let result = err!(self.builder.build_bit_cast(
+                    result,
+                    self.intrinsics.i64x2_ty,
+                    ""
+                ))
+                .into_vector_value();
+                let idx0 = self.intrinsics.i32_ty.const_zero();
+                let idx1 = self.intrinsics.i32_ty.const_int(1, false);
+                let result_lo = err!(self.builder.build_extract_element(result, idx0, ""));
+                let result_hi = err!(self.builder.build_extract_element(result, idx1, ""));
+
+                self.state.push1(result_lo);
+                self.state.push1(result_hi);
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    // Floating-Point Arithmetic instructions.
+    // https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#floating-point-arithmetic-instructions
+    fn translate_floating_point_arithmetic_operator(
+        &mut self,
+        op: Operator,
+    ) -> Result<(), CompileError> {
+        match op {
             Operator::F32Add => {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.add_f32,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.add_f32,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(
                     res,
                     ((i1.strip_pending() & i2.strip_pending())? | ExtraInfo::pending_f32_nan())?,
@@ -4821,18 +5923,19 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             Operator::F64Add => {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, v2) = (v1.into_float_value(), v2.into_float_value());
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.add_f64,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.add_f64,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(
                     res,
                     ((i1.strip_pending() & i2.strip_pending())? | ExtraInfo::pending_f64_nan())?,
@@ -4842,18 +5945,19 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, i1) = self.v128_into_f32x4(v1, i1)?;
                 let (v2, i2) = self.v128_into_f32x4(v2, i2)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.add_f32x4,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.add_f32x4,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -4867,18 +5971,19 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, i1) = self.v128_into_f64x2(v1, i1)?;
                 let (v2, i2) = self.v128_into_f64x2(v2, i2)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.add_f64x2,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.add_f64x2,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -4891,18 +5996,19 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             Operator::F32Sub => {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, v2) = (v1.into_float_value(), v2.into_float_value());
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.sub_f32,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.sub_f32,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(
                     res,
                     ((i1.strip_pending() & i2.strip_pending())? | ExtraInfo::pending_f32_nan())?,
@@ -4911,18 +6017,19 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             Operator::F64Sub => {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, v2) = (v1.into_float_value(), v2.into_float_value());
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.sub_f64,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.sub_f64,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(
                     res,
                     ((i1.strip_pending() & i2.strip_pending())? | ExtraInfo::pending_f64_nan())?,
@@ -4932,18 +6039,19 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, i1) = self.v128_into_f32x4(v1, i1)?;
                 let (v2, i2) = self.v128_into_f32x4(v2, i2)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.sub_f32x4,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.sub_f32x4,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -4957,18 +6065,19 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, i1) = self.v128_into_f64x2(v1, i1)?;
                 let (v2, i2) = self.v128_into_f64x2(v2, i2)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.sub_f64x2,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.sub_f64x2,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -4981,18 +6090,19 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             Operator::F32Mul => {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, v2) = (v1.into_float_value(), v2.into_float_value());
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.mul_f32,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.mul_f32,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(
                     res,
                     ((i1.strip_pending() & i2.strip_pending())? | ExtraInfo::pending_f32_nan())?,
@@ -5001,18 +6111,19 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             Operator::F64Mul => {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, v2) = (v1.into_float_value(), v2.into_float_value());
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.mul_f64,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.mul_f64,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(
                     res,
                     ((i1.strip_pending() & i2.strip_pending())? | ExtraInfo::pending_f64_nan())?,
@@ -5022,18 +6133,19 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, i1) = self.v128_into_f32x4(v1, i1)?;
                 let (v2, i2) = self.v128_into_f32x4(v2, i2)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.mul_f32x4,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.mul_f32x4,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -5043,22 +6155,104 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                     ((i1.strip_pending() & i2.strip_pending())? | ExtraInfo::pending_f32_nan())?,
                 );
             }
+            Operator::F32x4RelaxedMadd | Operator::F32x4RelaxedNmadd
+                if self.cpu_features.contains(CpuFeature::FMA) =>
+            {
+                let ((v1, i1), (v2, i2), (v3, i3)) = self.state.pop3_extra()?;
+                let (v1, i1) = self.v128_into_f32x4(v1, i1)?;
+                let (v2, i2) = self.v128_into_f32x4(v2, i2)?;
+                let (v3, i3) = self.v128_into_f32x4(v3, i3)?;
+
+                let v1 = match op {
+                    Operator::F32x4RelaxedNmadd => err!(self.builder.build_float_neg(v1, "")),
+                    _ => v1,
+                };
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.muladd_f32x4,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            v3.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
+                );
+                let info = (i1.strip_pending() & i2.strip_pending())?;
+                let info = (info & i3.strip_pending())?;
+                let info = (info | ExtraInfo::pending_f32_nan())?;
+                self.state.push1_extra(res, info);
+            }
+            Operator::F32x4RelaxedMadd | Operator::F32x4RelaxedNmadd => {
+                let ((v1, i1), (v2, i2), (v3, i3)) = self.state.pop3_extra()?;
+                let (v1, i1) = self.v128_into_f32x4(v1, i1)?;
+                let (v2, i2) = self.v128_into_f32x4(v2, i2)?;
+                let (v3, i3) = self.v128_into_f32x4(v3, i3)?;
+
+                let v1 = match op {
+                    Operator::F32x4RelaxedNmadd => err!(self.builder.build_float_neg(v1, "")),
+                    _ => v1,
+                };
+                let mul = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.mul_f32x4,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let mul = mul.into_vector_value();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.add_f32x4,
+                        &[
+                            mul.into(),
+                            v3.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
+                );
+                let info = (i1.strip_pending() & i2.strip_pending())?;
+                let info = (info & i3.strip_pending())?;
+                let info = (info | ExtraInfo::pending_f32_nan())?;
+                self.state.push1_extra(res, info);
+            }
             Operator::F64x2Mul => {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, i1) = self.v128_into_f64x2(v1, i1)?;
                 let (v2, i2) = self.v128_into_f64x2(v2, i2)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.mul_f64x2,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.mul_f64x2,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -5068,56 +6262,140 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                     ((i1.strip_pending() & i2.strip_pending())? | ExtraInfo::pending_f64_nan())?,
                 );
             }
+            Operator::F64x2RelaxedMadd | Operator::F64x2RelaxedNmadd
+                if self.cpu_features.contains(CpuFeature::FMA) =>
+            {
+                let ((v1, i1), (v2, i2), (v3, i3)) = self.state.pop3_extra()?;
+                let (v1, i1) = self.v128_into_f64x2(v1, i1)?;
+                let (v2, i2) = self.v128_into_f64x2(v2, i2)?;
+                let (v3, i3) = self.v128_into_f64x2(v3, i3)?;
+
+                let v1 = match op {
+                    Operator::F64x2RelaxedNmadd => err!(self.builder.build_float_neg(v1, "")),
+                    _ => v1,
+                };
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.muladd_f64x2,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            v3.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
+                );
+                let info = (i1.strip_pending() & i2.strip_pending())?;
+                let info = (info & i3.strip_pending())?;
+                let info = (info | ExtraInfo::pending_f64_nan())?;
+                self.state.push1_extra(res, info);
+            }
+            Operator::F64x2RelaxedMadd | Operator::F64x2RelaxedNmadd => {
+                let ((v1, i1), (v2, i2), (v3, i3)) = self.state.pop3_extra()?;
+                let (v1, i1) = self.v128_into_f64x2(v1, i1)?;
+                let (v2, i2) = self.v128_into_f64x2(v2, i2)?;
+                let (v3, i3) = self.v128_into_f64x2(v3, i3)?;
+
+                let v1 = match op {
+                    Operator::F64x2RelaxedNmadd => err!(self.builder.build_float_neg(v1, "")),
+                    _ => v1,
+                };
+                let mul = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.mul_f64x2,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let mul = mul.into_vector_value();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.add_f64x2,
+                        &[
+                            mul.into(),
+                            v3.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
+                );
+                let info = (i1.strip_pending() & i2.strip_pending())?;
+                let info = (info & i3.strip_pending())?;
+                let info = (info | ExtraInfo::pending_f64_nan())?;
+                self.state.push1_extra(res, info);
+            }
             Operator::F32Div => {
                 let (v1, v2) = self.state.pop2()?;
                 let (v1, v2) = (v1.into_float_value(), v2.into_float_value());
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.div_f32,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.div_f32,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(res, ExtraInfo::pending_f32_nan());
             }
             Operator::F64Div => {
                 let (v1, v2) = self.state.pop2()?;
                 let (v1, v2) = (v1.into_float_value(), v2.into_float_value());
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.div_f64,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.div_f64,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(res, ExtraInfo::pending_f64_nan());
             }
             Operator::F32x4Div => {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, _) = self.v128_into_f32x4(v1, i1)?;
                 let (v2, _) = self.v128_into_f32x4(v2, i2)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.div_f32x4,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.div_f32x4,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -5128,18 +6406,19 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let (v1, _) = self.v128_into_f64x2(v1, i1)?;
                 let (v2, _) = self.v128_into_f64x2(v2, i2)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.div_f64x2,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.div_f64x2,
+                        &[
+                            v1.into(),
+                            v2.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -5148,36 +6427,35 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::F32Sqrt => {
                 let input = self.state.pop1()?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.sqrt_f32,
-                    &[input.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.sqrt_f32,
+                        &[input.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(res, ExtraInfo::pending_f32_nan());
             }
             Operator::F64Sqrt => {
                 let input = self.state.pop1()?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.sqrt_f64,
-                    &[input.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.sqrt_f64,
+                        &[input.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(res, ExtraInfo::pending_f64_nan());
             }
             Operator::F32x4Sqrt => {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, _) = self.v128_into_f32x4(v, i)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.sqrt_f32x4,
-                    &[v.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(self.intrinsics.sqrt_f32x4, &[v.into()], "")?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let bits = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "bits")
@@ -5187,13 +6465,10 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             Operator::F64x2Sqrt => {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, _) = self.v128_into_f64x2(v, i)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.sqrt_f64x2,
-                    &[v.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(self.intrinsics.sqrt_f64x2, &[v.into()], "")?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let bits = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "bits")
@@ -5201,323 +6476,96 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 self.state.push1(bits);
             }
             Operator::F32Min => {
-                // This implements the same logic as LLVM's @llvm.minimum
-                // intrinsic would, but x86 lowering of that intrinsic
-                // encounters a fatal error in LLVM 11.
-                let (v1, v2) = self.state.pop2()?;
-                let v1 = self.canonicalize_nans(v1)?;
-                let v2 = self.canonicalize_nans(v2)?;
+                let ((lhs, lhs_info), (rhs, rhs_info)) = self.state.pop2_extra()?;
+                let lhs = self
+                    .apply_pending_canonicalization(lhs, lhs_info)?
+                    .into_float_value();
+                let rhs = self
+                    .apply_pending_canonicalization(rhs, rhs_info)?
+                    .into_float_value();
 
-                let v1_is_nan = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f32,
-                    &[
-                        v1.into(),
-                        self.intrinsics.f32_zero.into(),
-                        self.intrinsics.fp_uno_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-                let v2_is_nan = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f32,
-                    &[
-                        v2.into(),
-                        self.intrinsics.f32_zero.into(),
-                        self.intrinsics.fp_uno_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-                let v1_lt_v2 = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f32,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_olt_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-                let v1_gt_v2 = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f32,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_ogt_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-
-                let res = err!(self.builder.build_select(
-                    v1_is_nan,
-                    self.quiet_nan(v1)?,
-                    err!(self.builder.build_select(
-                        v2_is_nan,
-                        self.quiet_nan(v2)?,
-                        err!(self.builder.build_select(
-                            v1_lt_v2,
-                            v1,
-                            err!(self.builder.build_select(
-                                v1_gt_v2,
-                                v2,
-                                err!(self.builder.build_bit_cast(
-                                    err!(self.builder.build_or(
-                                        err!(self.builder.build_bit_cast(
-                                            v1,
-                                            self.intrinsics.i32_ty,
-                                            ""
-                                        ))
-                                        .into_int_value(),
-                                        err!(self.builder.build_bit_cast(
-                                            v2,
-                                            self.intrinsics.i32_ty,
-                                            ""
-                                        ))
-                                        .into_int_value(),
-                                        "",
-                                    )),
-                                    self.intrinsics.f32_ty,
-                                    "",
-                                )),
-                                "",
-                            )),
-                            "",
-                        )),
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.minimum_f32,
+                        &[lhs.into(), rhs.into()],
                         "",
-                    )),
-                    "",
-                ));
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
 
-                self.state.push1(res);
+                let res = self.finalize_minmax_result(res.as_basic_value_enum())?;
+                let res = res.into_float_value();
+
+                self.state.push1_extra(res, ExtraInfo::pending_f32_nan());
             }
             Operator::F64Min => {
-                // This implements the same logic as LLVM's @llvm.minimum
-                // intrinsic would, but x86 lowering of that intrinsic
-                // encounters a fatal error in LLVM 11.
-                let (v1, v2) = self.state.pop2()?;
-                let v1 = self.canonicalize_nans(v1)?;
-                let v2 = self.canonicalize_nans(v2)?;
+                let ((lhs, lhs_info), (rhs, rhs_info)) = self.state.pop2_extra()?;
+                let lhs = self
+                    .apply_pending_canonicalization(lhs, lhs_info)?
+                    .into_float_value();
+                let rhs = self
+                    .apply_pending_canonicalization(rhs, rhs_info)?
+                    .into_float_value();
 
-                let v1_is_nan = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f64,
-                    &[
-                        v1.into(),
-                        self.intrinsics.f64_zero.into(),
-                        self.intrinsics.fp_uno_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-                let v2_is_nan = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f64,
-                    &[
-                        v2.into(),
-                        self.intrinsics.f64_zero.into(),
-                        self.intrinsics.fp_uno_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-                let v1_lt_v2 = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f64,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_olt_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-                let v1_gt_v2 = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f64,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_ogt_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-
-                let res = err!(self.builder.build_select(
-                    v1_is_nan,
-                    self.quiet_nan(v1)?,
-                    err!(self.builder.build_select(
-                        v2_is_nan,
-                        self.quiet_nan(v2)?,
-                        err!(self.builder.build_select(
-                            v1_lt_v2,
-                            v1,
-                            err!(self.builder.build_select(
-                                v1_gt_v2,
-                                v2,
-                                err!(self.builder.build_bit_cast(
-                                    err!(self.builder.build_or(
-                                        err!(self.builder.build_bit_cast(
-                                            v1,
-                                            self.intrinsics.i64_ty,
-                                            ""
-                                        ))
-                                        .into_int_value(),
-                                        err!(self.builder.build_bit_cast(
-                                            v2,
-                                            self.intrinsics.i64_ty,
-                                            ""
-                                        ))
-                                        .into_int_value(),
-                                        "",
-                                    )),
-                                    self.intrinsics.f64_ty,
-                                    "",
-                                )),
-                                "",
-                            )),
-                            "",
-                        )),
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.minimum_f64,
+                        &[lhs.into(), rhs.into()],
                         "",
-                    )),
-                    "",
-                ));
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
 
-                self.state.push1(res);
+                let res = self.finalize_minmax_result(res.as_basic_value_enum())?;
+                let res = res.into_float_value();
+
+                self.state.push1_extra(res, ExtraInfo::pending_f64_nan());
             }
-            Operator::F32x4Min => {
-                // This implements the same logic as LLVM's @llvm.minimum
-                // intrinsic would, but x86 lowering of that intrinsic
-                // encounters a fatal error in LLVM 11.
+            Operator::F32x4RelaxedMin if self.cpu_features.contains(CpuFeature::SSE2) => {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
-                let (v1, _) = self.v128_into_f32x4(v1, i1)?;
-                let (v2, _) = self.v128_into_f32x4(v2, i2)?;
-
-                let v1_is_nan = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f32x4,
-                    &[
-                        v1.into(),
-                        self.intrinsics.f32x4_zero.into(),
-                        self.intrinsics.fp_uno_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-                let v2_is_nan = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f32x4,
-                    &[
-                        v2.into(),
-                        self.intrinsics.f32x4_zero.into(),
-                        self.intrinsics.fp_uno_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-                let v1_lt_v2 = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f32x4,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_olt_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-                let v1_gt_v2 = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f32x4,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_ogt_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-
-                let res = err!(
-                    self.builder.build_select(
-                        v1_is_nan,
-                        self.quiet_nan(v1.into())?.into_vector_value(),
-                        err!(
-                            self.builder.build_select(
-                                v2_is_nan,
-                                self.quiet_nan(v2.into())?.into_vector_value(),
-                                err!(self.builder.build_select(
-                                    v1_lt_v2,
-                                    v1.into(),
-                                    err!(self.builder.build_select(
-                                        v1_gt_v2,
-                                        v2.into(),
-                                        err!(self.builder.build_bit_cast(
-                                            err!(self.builder.build_or(
-                                        err!(self.builder.build_bit_cast(
-                                            v1,
-                                            self.intrinsics.i32x4_ty,
-                                            "",
-                                        ))
-                                        .into_vector_value(),
-                                        err!(self.builder.build_bit_cast(
-                                            v2,
-                                            self.intrinsics.i32x4_ty,
-                                            "",
-                                        ))
-                                        .into_vector_value(),
-                                        "",
-                                    )),
-                                            self.intrinsics.f32x4_ty,
-                                            "",
-                                        )),
-                                        "",
-                                    )),
-                                    "",
-                                ))
-                                .into_vector_value(),
-                                "",
-                            )
-                        )
-                        .into_vector_value(),
+                let (v1, i1) = self.v128_into_f32x4(v1, i1)?;
+                let (v2, i2) = self.v128_into_f32x4(v2, i2)?;
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.x86_64.min_ps,
+                        &[v1.into(), v2.into()],
                         "",
-                    )
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
+                self.state.push1_extra(
+                    res,
+                    ((i1.strip_pending() & i2.strip_pending())? | ExtraInfo::pending_f32_nan())?,
+                );
+            }
+            Operator::F32x4Min | Operator::F32x4RelaxedMin => {
+                let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
+                let (v1, i1) = self.v128_into_f32x4(v1, i1)?;
+                let (v2, i2) = self.v128_into_f32x4(v2, i2)?;
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.minimum_f32x4,
+                        &[v1.into(), v2.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+
+                let res = self.finalize_minmax_result(res.as_basic_value_enum())?;
+                let res = res.into_vector_value();
 
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
-                self.state.push1(res);
+                self.state.push1_extra(
+                    res,
+                    ((i1.strip_pending() & i2.strip_pending())? | ExtraInfo::pending_f32_nan())?,
+                );
             }
             Operator::F32x4PMin => {
                 // Pseudo-min: b < a ? b : a
@@ -5535,118 +6583,51 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 );
                 self.state.push1(res);
             }
-            Operator::F64x2Min => {
-                // This implements the same logic as LLVM's @llvm.minimum
-                // intrinsic would, but x86 lowering of that intrinsic
-                // encounters a fatal error in LLVM 11.
+            Operator::F64x2RelaxedMin if self.cpu_features.contains(CpuFeature::SSE2) => {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
-                let (v1, _) = self.v128_into_f64x2(v1, i1)?;
-                let (v2, _) = self.v128_into_f64x2(v2, i2)?;
-
-                let v1_is_nan = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f64x2,
-                    &[
-                        v1.into(),
-                        self.intrinsics.f64x2_zero.into(),
-                        self.intrinsics.fp_uno_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-                let v2_is_nan = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f64x2,
-                    &[
-                        v2.into(),
-                        self.intrinsics.f64x2_zero.into(),
-                        self.intrinsics.fp_uno_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-                let v1_lt_v2 = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f64x2,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_olt_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-                let v1_gt_v2 = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f64x2,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_ogt_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-
-                let res = err!(
-                    self.builder.build_select(
-                        v1_is_nan,
-                        self.quiet_nan(v1.into())?.into_vector_value(),
-                        err!(
-                            self.builder.build_select(
-                                v2_is_nan,
-                                self.quiet_nan(v2.into())?.into_vector_value(),
-                                err!(self.builder.build_select(
-                                    v1_lt_v2,
-                                    v1.into(),
-                                    err!(self.builder.build_select(
-                                        v1_gt_v2,
-                                        v2.into(),
-                                        err!(self.builder.build_bit_cast(
-                                            err!(self.builder.build_or(
-                                        err!(self.builder.build_bit_cast(
-                                            v1,
-                                            self.intrinsics.i64x2_ty,
-                                            "",
-                                        ))
-                                        .into_vector_value(),
-                                        err!(self.builder.build_bit_cast(
-                                            v2,
-                                            self.intrinsics.i64x2_ty,
-                                            "",
-                                        ))
-                                        .into_vector_value(),
-                                        "",
-                                    )),
-                                            self.intrinsics.f64x2_ty,
-                                            "",
-                                        )),
-                                        "",
-                                    )),
-                                    "",
-                                ))
-                                .into_vector_value(),
-                                "",
-                            )
-                        )
-                        .into_vector_value(),
+                let (v1, i1) = self.v128_into_f64x2(v1, i1)?;
+                let (v2, i2) = self.v128_into_f64x2(v2, i2)?;
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.x86_64.min_pd,
+                        &[v1.into(), v2.into()],
                         "",
-                    )
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
+                self.state.push1_extra(
+                    res,
+                    ((i1.strip_pending() & i2.strip_pending())? | ExtraInfo::pending_f64_nan())?,
+                );
+            }
+            Operator::F64x2Min | Operator::F64x2RelaxedMin => {
+                let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
+                let (v1, i1) = self.v128_into_f64x2(v1, i1)?;
+                let (v2, i2) = self.v128_into_f64x2(v2, i2)?;
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.minimum_f64x2,
+                        &[v1.into(), v2.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+
+                let res = self.finalize_minmax_result(res.as_basic_value_enum())?;
+                let res = res.into_vector_value();
 
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
-                self.state.push1(res);
+                self.state.push1_extra(
+                    res,
+                    ((i1.strip_pending() & i2.strip_pending())? | ExtraInfo::pending_f64_nan())?,
+                );
             }
             Operator::F64x2PMin => {
                 // Pseudo-min: b < a ? b : a
@@ -5665,323 +6646,96 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 self.state.push1(res);
             }
             Operator::F32Max => {
-                // This implements the same logic as LLVM's @llvm.maximum
-                // intrinsic would, but x86 lowering of that intrinsic
-                // encounters a fatal error in LLVM 11.
-                let (v1, v2) = self.state.pop2()?;
-                let v1 = self.canonicalize_nans(v1)?;
-                let v2 = self.canonicalize_nans(v2)?;
+                let ((lhs, lhs_info), (rhs, rhs_info)) = self.state.pop2_extra()?;
+                let lhs = self
+                    .apply_pending_canonicalization(lhs, lhs_info)?
+                    .into_float_value();
+                let rhs = self
+                    .apply_pending_canonicalization(rhs, rhs_info)?
+                    .into_float_value();
 
-                let v1_is_nan = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f32,
-                    &[
-                        v1.into(),
-                        self.intrinsics.f32_zero.into(),
-                        self.intrinsics.fp_uno_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-                let v2_is_nan = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f32,
-                    &[
-                        v2.into(),
-                        self.intrinsics.f32_zero.into(),
-                        self.intrinsics.fp_uno_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-                let v1_lt_v2 = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f32,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_olt_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-                let v1_gt_v2 = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f32,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_ogt_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-
-                let res = err!(self.builder.build_select(
-                    v1_is_nan,
-                    self.quiet_nan(v1)?,
-                    err!(self.builder.build_select(
-                        v2_is_nan,
-                        self.quiet_nan(v2)?,
-                        err!(self.builder.build_select(
-                            v1_lt_v2,
-                            v2,
-                            err!(self.builder.build_select(
-                                v1_gt_v2,
-                                v1,
-                                err!(self.builder.build_bit_cast(
-                                    err!(self.builder.build_and(
-                                        err!(self.builder.build_bit_cast(
-                                            v1,
-                                            self.intrinsics.i32_ty,
-                                            ""
-                                        ))
-                                        .into_int_value(),
-                                        err!(self.builder.build_bit_cast(
-                                            v2,
-                                            self.intrinsics.i32_ty,
-                                            ""
-                                        ))
-                                        .into_int_value(),
-                                        "",
-                                    )),
-                                    self.intrinsics.f32_ty,
-                                    "",
-                                )),
-                                "",
-                            )),
-                            "",
-                        )),
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.maximum_f32,
+                        &[lhs.into(), rhs.into()],
                         "",
-                    )),
-                    "",
-                ));
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
 
-                self.state.push1(res);
+                let res = self.finalize_minmax_result(res.as_basic_value_enum())?;
+                let res = res.into_float_value();
+
+                self.state.push1_extra(res, ExtraInfo::pending_f32_nan());
             }
             Operator::F64Max => {
-                // This implements the same logic as LLVM's @llvm.maximum
-                // intrinsic would, but x86 lowering of that intrinsic
-                // encounters a fatal error in LLVM 11.
-                let (v1, v2) = self.state.pop2()?;
-                let v1 = self.canonicalize_nans(v1)?;
-                let v2 = self.canonicalize_nans(v2)?;
+                let ((lhs, lhs_info), (rhs, rhs_info)) = self.state.pop2_extra()?;
+                let lhs = self
+                    .apply_pending_canonicalization(lhs, lhs_info)?
+                    .into_float_value();
+                let rhs = self
+                    .apply_pending_canonicalization(rhs, rhs_info)?
+                    .into_float_value();
 
-                let v1_is_nan = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f64,
-                    &[
-                        v1.into(),
-                        self.intrinsics.f64_zero.into(),
-                        self.intrinsics.fp_uno_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-                let v2_is_nan = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f64,
-                    &[
-                        v2.into(),
-                        self.intrinsics.f64_zero.into(),
-                        self.intrinsics.fp_uno_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-                let v1_lt_v2 = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f64,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_olt_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-                let v1_gt_v2 = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f64,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_ogt_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-
-                let res = err!(self.builder.build_select(
-                    v1_is_nan,
-                    self.quiet_nan(v1)?,
-                    err!(self.builder.build_select(
-                        v2_is_nan,
-                        self.quiet_nan(v2)?,
-                        err!(self.builder.build_select(
-                            v1_lt_v2,
-                            v2,
-                            err!(self.builder.build_select(
-                                v1_gt_v2,
-                                v1,
-                                err!(self.builder.build_bit_cast(
-                                    err!(self.builder.build_and(
-                                        err!(self.builder.build_bit_cast(
-                                            v1,
-                                            self.intrinsics.i64_ty,
-                                            ""
-                                        ))
-                                        .into_int_value(),
-                                        err!(self.builder.build_bit_cast(
-                                            v2,
-                                            self.intrinsics.i64_ty,
-                                            ""
-                                        ))
-                                        .into_int_value(),
-                                        "",
-                                    )),
-                                    self.intrinsics.f64_ty,
-                                    "",
-                                )),
-                                "",
-                            )),
-                            "",
-                        )),
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.maximum_f64,
+                        &[lhs.into(), rhs.into()],
                         "",
-                    )),
-                    "",
-                ));
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
 
-                self.state.push1(res);
+                let res = self.finalize_minmax_result(res.as_basic_value_enum())?;
+                let res = res.into_float_value();
+
+                self.state.push1_extra(res, ExtraInfo::pending_f64_nan());
             }
-            Operator::F32x4Max => {
-                // This implements the same logic as LLVM's @llvm.maximum
-                // intrinsic would, but x86 lowering of that intrinsic
-                // encounters a fatal error in LLVM 11.
+            Operator::F32x4RelaxedMax if self.cpu_features.contains(CpuFeature::SSE2) => {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
-                let (v1, _) = self.v128_into_f32x4(v1, i1)?;
-                let (v2, _) = self.v128_into_f32x4(v2, i2)?;
-
-                let v1_is_nan = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f32x4,
-                    &[
-                        v1.into(),
-                        self.intrinsics.f32x4_zero.into(),
-                        self.intrinsics.fp_uno_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-                let v2_is_nan = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f32x4,
-                    &[
-                        v2.into(),
-                        self.intrinsics.f32x4_zero.into(),
-                        self.intrinsics.fp_uno_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-                let v1_lt_v2 = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f32x4,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_olt_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-                let v1_gt_v2 = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f32x4,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_ogt_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-
-                let res = err!(
-                    self.builder.build_select(
-                        v1_is_nan,
-                        self.quiet_nan(v1.into())?.into_vector_value(),
-                        err!(
-                            self.builder.build_select(
-                                v2_is_nan,
-                                self.quiet_nan(v2.into())?.into_vector_value(),
-                                err!(self.builder.build_select(
-                                    v1_lt_v2,
-                                    v2.into(),
-                                    err!(self.builder.build_select(
-                                        v1_gt_v2,
-                                        v1.into(),
-                                        err!(self.builder.build_bit_cast(
-                                            err!(self.builder.build_and(
-                                        err!(self.builder.build_bit_cast(
-                                            v1,
-                                            self.intrinsics.i32x4_ty,
-                                            "",
-                                        ))
-                                        .into_vector_value(),
-                                        err!(self.builder.build_bit_cast(
-                                            v2,
-                                            self.intrinsics.i32x4_ty,
-                                            "",
-                                        ))
-                                        .into_vector_value(),
-                                        "",
-                                    )),
-                                            self.intrinsics.f32x4_ty,
-                                            "",
-                                        )),
-                                        "",
-                                    )),
-                                    "",
-                                ))
-                                .into_vector_value(),
-                                "",
-                            )
-                        )
-                        .into_vector_value(),
+                let (v1, i1) = self.v128_into_f32x4(v1, i1)?;
+                let (v2, i2) = self.v128_into_f32x4(v2, i2)?;
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.x86_64.max_ps,
+                        &[v1.into(), v2.into()],
                         "",
-                    )
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
+                self.state.push1_extra(
+                    res,
+                    ((i1.strip_pending() & i2.strip_pending())? | ExtraInfo::pending_f32_nan())?,
+                );
+            }
+            Operator::F32x4Max | Operator::F32x4RelaxedMax => {
+                let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
+                let (v1, i1) = self.v128_into_f32x4(v1, i1)?;
+                let (v2, i2) = self.v128_into_f32x4(v2, i2)?;
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.maximum_f32x4,
+                        &[v1.into(), v2.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+
+                let res = self.finalize_minmax_result(res.as_basic_value_enum())?;
+                let res = res.into_vector_value();
 
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
-                self.state.push1(res);
+                self.state.push1_extra(
+                    res,
+                    ((i1.strip_pending() & i2.strip_pending())? | ExtraInfo::pending_f32_nan())?,
+                );
             }
             Operator::F32x4PMax => {
                 // Pseudo-max: a < b ? b : a
@@ -6000,118 +6754,51 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 );
                 self.state.push1(res);
             }
-            Operator::F64x2Max => {
-                // This implements the same logic as LLVM's @llvm.maximum
-                // intrinsic would, but x86 lowering of that intrinsic
-                // encounters a fatal error in LLVM 11.
+            Operator::F64x2RelaxedMax if self.cpu_features.contains(CpuFeature::SSE2) => {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
-                let (v1, _) = self.v128_into_f64x2(v1, i1)?;
-                let (v2, _) = self.v128_into_f64x2(v2, i2)?;
-
-                let v1_is_nan = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f64x2,
-                    &[
-                        v1.into(),
-                        self.intrinsics.f64x2_zero.into(),
-                        self.intrinsics.fp_uno_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-                let v2_is_nan = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f64x2,
-                    &[
-                        v2.into(),
-                        self.intrinsics.f64x2_zero.into(),
-                        self.intrinsics.fp_uno_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-                let v1_lt_v2 = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f64x2,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_olt_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-                let v1_gt_v2 = err!(self.builder.build_call(
-                    self.intrinsics.cmp_f64x2,
-                    &[
-                        v1.into(),
-                        v2.into(),
-                        self.intrinsics.fp_ogt_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-
-                let res = err!(
-                    self.builder.build_select(
-                        v1_is_nan,
-                        self.quiet_nan(v1.into())?.into_vector_value(),
-                        err!(
-                            self.builder.build_select(
-                                v2_is_nan,
-                                self.quiet_nan(v2.into())?.into_vector_value(),
-                                err!(self.builder.build_select(
-                                    v1_lt_v2,
-                                    v2.into(),
-                                    err!(self.builder.build_select(
-                                        v1_gt_v2,
-                                        v1.into(),
-                                        err!(self.builder.build_bit_cast(
-                                            err!(self.builder.build_and(
-                                        err!(self.builder.build_bit_cast(
-                                            v1,
-                                            self.intrinsics.i64x2_ty,
-                                            "",
-                                        ))
-                                        .into_vector_value(),
-                                        err!(self.builder.build_bit_cast(
-                                            v2,
-                                            self.intrinsics.i64x2_ty,
-                                            "",
-                                        ))
-                                        .into_vector_value(),
-                                        "",
-                                    )),
-                                            self.intrinsics.f64x2_ty,
-                                            "",
-                                        )),
-                                        "",
-                                    )),
-                                    "",
-                                ))
-                                .into_vector_value(),
-                                "",
-                            )
-                        )
-                        .into_vector_value(),
+                let (v1, i1) = self.v128_into_f64x2(v1, i1)?;
+                let (v2, i2) = self.v128_into_f64x2(v2, i2)?;
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.x86_64.max_pd,
+                        &[v1.into(), v2.into()],
                         "",
-                    )
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
+                self.state.push1_extra(
+                    res,
+                    ((i1.strip_pending() & i2.strip_pending())? | ExtraInfo::pending_f64_nan())?,
+                );
+            }
+            Operator::F64x2Max | Operator::F64x2RelaxedMax => {
+                let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
+                let (v1, i1) = self.v128_into_f64x2(v1, i1)?;
+                let (v2, i2) = self.v128_into_f64x2(v2, i2)?;
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.maximum_f64x2,
+                        &[v1.into(), v2.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+
+                let res = self.finalize_minmax_result(res.as_basic_value_enum())?;
+                let res = res.into_vector_value();
 
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
-                self.state.push1(res);
+                self.state.push1_extra(
+                    res,
+                    ((i1.strip_pending() & i2.strip_pending())? | ExtraInfo::pending_f64_nan())?,
+                );
             }
             Operator::F64x2PMax => {
                 // Pseudo-max: a < b ? b : a
@@ -6131,233 +6818,233 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::F32Ceil => {
                 let (input, info) = self.state.pop1_extra()?;
-                let res = err!(self.builder.build_call(
+                let res = err!(self.build_call_with_param_attributes(
                     self.intrinsics.ceil_f32,
                     &[input.into()],
                     ""
                 ))
                 .try_as_basic_value()
                 .unwrap_basic();
-                self.state
-                    .push1_extra(res, (info | ExtraInfo::pending_f32_nan())?);
+                let (res, info) = self.finalize_rounding_result(res, info)?;
+                self.state.push1_extra(res, info);
             }
             Operator::F32x4Ceil => {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, _) = self.v128_into_f32x4(v, i)?;
-                let res = err!(self.builder.build_call(
+                let res = err!(self.build_call_with_param_attributes(
                     self.intrinsics.ceil_f32x4,
                     &[v.into()],
                     ""
                 ))
                 .try_as_basic_value()
                 .unwrap_basic();
+                let (res, info) = self.finalize_rounding_result(res, i)?;
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
-                self.state
-                    .push1_extra(res, (i | ExtraInfo::pending_f32_nan())?);
+                self.state.push1_extra(res, info);
             }
             Operator::F64Ceil => {
                 let (input, info) = self.state.pop1_extra()?;
-                let res = err!(self.builder.build_call(
+                let res = err!(self.build_call_with_param_attributes(
                     self.intrinsics.ceil_f64,
                     &[input.into()],
                     ""
                 ))
                 .try_as_basic_value()
                 .unwrap_basic();
-                self.state
-                    .push1_extra(res, (info | ExtraInfo::pending_f64_nan())?);
+                let (res, info) = self.finalize_rounding_result(res, info)?;
+                self.state.push1_extra(res, info);
             }
             Operator::F64x2Ceil => {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, _) = self.v128_into_f64x2(v, i)?;
-                let res = err!(self.builder.build_call(
+                let res = err!(self.build_call_with_param_attributes(
                     self.intrinsics.ceil_f64x2,
                     &[v.into()],
                     ""
                 ))
                 .try_as_basic_value()
                 .unwrap_basic();
+                let (res, info) = self.finalize_rounding_result(res, i)?;
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
-                self.state
-                    .push1_extra(res, (i | ExtraInfo::pending_f64_nan())?);
+                self.state.push1_extra(res, info);
             }
             Operator::F32Floor => {
                 let (input, info) = self.state.pop1_extra()?;
-                let res = err!(self.builder.build_call(
+                let res = err!(self.build_call_with_param_attributes(
                     self.intrinsics.floor_f32,
                     &[input.into()],
                     ""
                 ))
                 .try_as_basic_value()
                 .unwrap_basic();
-                self.state
-                    .push1_extra(res, (info | ExtraInfo::pending_f32_nan())?);
+                let (res, info) = self.finalize_rounding_result(res, info)?;
+                self.state.push1_extra(res, info);
             }
             Operator::F32x4Floor => {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, _) = self.v128_into_f32x4(v, i)?;
-                let res = err!(self.builder.build_call(
+                let res = err!(self.build_call_with_param_attributes(
                     self.intrinsics.floor_f32x4,
                     &[v.into()],
                     ""
                 ))
                 .try_as_basic_value()
                 .unwrap_basic();
+                let (res, info) = self.finalize_rounding_result(res, i)?;
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
-                self.state
-                    .push1_extra(res, (i | ExtraInfo::pending_f32_nan())?);
+                self.state.push1_extra(res, info);
             }
             Operator::F64Floor => {
                 let (input, info) = self.state.pop1_extra()?;
-                let res = err!(self.builder.build_call(
+                let res = err!(self.build_call_with_param_attributes(
                     self.intrinsics.floor_f64,
                     &[input.into()],
                     ""
                 ))
                 .try_as_basic_value()
                 .unwrap_basic();
-                self.state
-                    .push1_extra(res, (info | ExtraInfo::pending_f64_nan())?);
+                let (res, info) = self.finalize_rounding_result(res, info)?;
+                self.state.push1_extra(res, info);
             }
             Operator::F64x2Floor => {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, _) = self.v128_into_f64x2(v, i)?;
-                let res = err!(self.builder.build_call(
+                let res = err!(self.build_call_with_param_attributes(
                     self.intrinsics.floor_f64x2,
                     &[v.into()],
                     ""
                 ))
                 .try_as_basic_value()
                 .unwrap_basic();
+                let (res, info) = self.finalize_rounding_result(res, i)?;
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
-                self.state
-                    .push1_extra(res, (i | ExtraInfo::pending_f64_nan())?);
+                self.state.push1_extra(res, info);
             }
             Operator::F32Trunc => {
-                let (v, i) = self.state.pop1_extra()?;
+                let (v, info) = self.state.pop1_extra()?;
                 let res = err!(
                     self.builder
                         .build_call(self.intrinsics.trunc_f32, &[v.into()], "")
                 )
                 .try_as_basic_value()
                 .unwrap_basic();
-                self.state
-                    .push1_extra(res, (i | ExtraInfo::pending_f32_nan())?);
+                let (res, info) = self.finalize_rounding_result(res, info)?;
+                self.state.push1_extra(res, info);
             }
             Operator::F32x4Trunc => {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, _) = self.v128_into_f32x4(v, i)?;
-                let res = err!(self.builder.build_call(
+                let res = err!(self.build_call_with_param_attributes(
                     self.intrinsics.trunc_f32x4,
                     &[v.into()],
                     ""
                 ))
                 .try_as_basic_value()
                 .unwrap_basic();
+                let (res, info) = self.finalize_rounding_result(res, i)?;
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
-                self.state
-                    .push1_extra(res, (i | ExtraInfo::pending_f32_nan())?);
+                self.state.push1_extra(res, info);
             }
             Operator::F64Trunc => {
-                let (v, i) = self.state.pop1_extra()?;
+                let (v, info) = self.state.pop1_extra()?;
                 let res = err!(
                     self.builder
                         .build_call(self.intrinsics.trunc_f64, &[v.into()], "")
                 )
                 .try_as_basic_value()
                 .unwrap_basic();
-                self.state
-                    .push1_extra(res, (i | ExtraInfo::pending_f64_nan())?);
+                let (res, info) = self.finalize_rounding_result(res, info)?;
+                self.state.push1_extra(res, info);
             }
             Operator::F64x2Trunc => {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, _) = self.v128_into_f64x2(v, i)?;
-                let res = err!(self.builder.build_call(
+                let res = err!(self.build_call_with_param_attributes(
                     self.intrinsics.trunc_f64x2,
                     &[v.into()],
                     ""
                 ))
                 .try_as_basic_value()
                 .unwrap_basic();
+                let (res, info) = self.finalize_rounding_result(res, i)?;
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
-                self.state
-                    .push1_extra(res, (i | ExtraInfo::pending_f64_nan())?);
+                self.state.push1_extra(res, info);
             }
             Operator::F32Nearest => {
-                let (v, i) = self.state.pop1_extra()?;
-                let res = err!(self.builder.build_call(
+                let (v, info) = self.state.pop1_extra()?;
+                let res = err!(self.build_call_with_param_attributes(
                     self.intrinsics.nearbyint_f32,
                     &[v.into()],
                     ""
                 ))
                 .try_as_basic_value()
                 .unwrap_basic();
-                self.state
-                    .push1_extra(res, (i | ExtraInfo::pending_f32_nan())?);
+                let (res, info) = self.finalize_rounding_result(res, info)?;
+                self.state.push1_extra(res, info);
             }
             Operator::F32x4Nearest => {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, _) = self.v128_into_f32x4(v, i)?;
-                let res = err!(self.builder.build_call(
+                let res = err!(self.build_call_with_param_attributes(
                     self.intrinsics.nearbyint_f32x4,
                     &[v.into()],
                     ""
                 ))
                 .try_as_basic_value()
                 .unwrap_basic();
+                let (res, info) = self.finalize_rounding_result(res, i)?;
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
-                self.state
-                    .push1_extra(res, (i | ExtraInfo::pending_f32_nan())?);
+                self.state.push1_extra(res, info);
             }
             Operator::F64Nearest => {
-                let (v, i) = self.state.pop1_extra()?;
-                let res = err!(self.builder.build_call(
+                let (v, info) = self.state.pop1_extra()?;
+                let res = err!(self.build_call_with_param_attributes(
                     self.intrinsics.nearbyint_f64,
                     &[v.into()],
                     ""
                 ))
                 .try_as_basic_value()
                 .unwrap_basic();
-                self.state
-                    .push1_extra(res, (i | ExtraInfo::pending_f64_nan())?);
+                let (res, info) = self.finalize_rounding_result(res, info)?;
+                self.state.push1_extra(res, info);
             }
             Operator::F64x2Nearest => {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, _) = self.v128_into_f64x2(v, i)?;
-                let res = err!(self.builder.build_call(
+                let res = err!(self.build_call_with_param_attributes(
                     self.intrinsics.nearbyint_f64x2,
                     &[v.into()],
                     ""
                 ))
                 .try_as_basic_value()
                 .unwrap_basic();
+                let (res, info) = self.finalize_rounding_result(res, i)?;
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
-                self.state
-                    .push1_extra(res, (i | ExtraInfo::pending_f64_nan())?);
+                self.state.push1_extra(res, info);
             }
             Operator::F32Abs => {
                 let (v, i) = self.state.pop1_extra()?;
@@ -6393,13 +7080,10 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                     ""
                 ));
                 let v = self.apply_pending_canonicalization(v, i)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.fabs_f32x4,
-                    &[v.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(self.intrinsics.fabs_f32x4, &[v.into()], "")?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -6416,13 +7100,10 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                     ""
                 ));
                 let v = self.apply_pending_canonicalization(v, i)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.fabs_f64x2,
-                    &[v.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(self.intrinsics.fabs_f64x2, &[v.into()], "")?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -6483,13 +7164,14 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ((mag, mag_info), (sgn, sgn_info)) = self.state.pop2_extra()?;
                 let mag = self.apply_pending_canonicalization(mag, mag_info)?;
                 let sgn = self.apply_pending_canonicalization(sgn, sgn_info)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.copysign_f32,
-                    &[mag.into(), sgn.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.copysign_f32,
+                        &[mag.into(), sgn.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 // The exact NaN returned by F32Copysign is fully defined.
                 // Do not adjust.
                 self.state.push1_extra(res, mag_info.strip_pending());
@@ -6498,22 +7180,27 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ((mag, mag_info), (sgn, sgn_info)) = self.state.pop2_extra()?;
                 let mag = self.apply_pending_canonicalization(mag, mag_info)?;
                 let sgn = self.apply_pending_canonicalization(sgn, sgn_info)?;
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.copysign_f64,
-                    &[mag.into(), sgn.into()],
-                    ""
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.copysign_f64,
+                        &[mag.into(), sgn.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 // The exact NaN returned by F32Copysign is fully defined.
                 // Do not adjust.
                 self.state.push1_extra(res, mag_info.strip_pending());
             }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
 
-            /***************************
-             * Integer Comparison instructions.
-             * https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#integer-comparison-instructions
-             ***************************/
+    // Integer Comparison instructions.
+    // https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#integer-comparison-instructions
+    fn translate_integer_comparison_operator(&mut self, op: Operator) -> Result<(), CompileError> {
+        match op {
             Operator::I32Eq | Operator::I64Eq => {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let v1 = self.apply_pending_canonicalization(v1, i1)?;
@@ -7306,11 +7993,18 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 );
                 self.state.push1(res);
             }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
 
-            /***************************
-             * Floating-Point Comparison instructions.
-             * https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#floating-point-comparison-instructions
-             ***************************/
+    // Floating-Point Comparison instructions.
+    // https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#floating-point-comparison-instructions
+    fn translate_floating_point_comparison_operator(
+        &mut self,
+        op: Operator,
+    ) -> Result<(), CompileError> {
+        match op {
             Operator::F32Eq | Operator::F64Eq => {
                 let (v1, v2) = self.state.pop2()?;
                 let (v1, v2) = (v1.into_float_value(), v2.into_float_value());
@@ -7623,11 +8317,15 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 );
                 self.state.push1(res);
             }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
 
-            /***************************
-             * Conversion instructions.
-             * https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#conversion-instructions
-             ***************************/
+    // Conversion instructions.
+    // https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#conversion-instructions
+    fn translate_conversion_operator(&mut self, op: Operator) -> Result<(), CompileError> {
+        match op {
             Operator::I32WrapI64 => {
                 let (v, i) = self.state.pop1_extra()?;
                 let v = self.apply_pending_canonicalization(v, i)?;
@@ -8185,7 +8883,24 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 );
                 self.state.push1(res);
             }
-            Operator::I32x4TruncSatF32x4S => {
+            Operator::I32x4RelaxedTruncF32x4S if self.cpu_features.contains(CpuFeature::SSE2) => {
+                let (v, i) = self.state.pop1_extra()?;
+                let (v, _) = self.v128_into_f32x4(v, i)?;
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.x86_64.cvttps2dq,
+                        &[v.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
+                );
+                self.state.push1(res);
+            }
+            Operator::I32x4TruncSatF32x4S | Operator::I32x4RelaxedTruncF32x4S => {
                 let (v, i) = self.state.pop1_extra()?;
                 let v = self.apply_pending_canonicalization(v, i)?;
                 let v = v.into_int_value();
@@ -8200,7 +8915,31 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 )?;
                 self.state.push1(res);
             }
-            Operator::I32x4TruncSatF32x4U => {
+            Operator::I32x4RelaxedTruncF32x4U
+                if self.cpu_features.contains(CpuFeature::AVX512F)
+                    && self.cpu_features.contains(CpuFeature::AVX512VL) =>
+            {
+                let (v, i) = self.state.pop1_extra()?;
+                let (v, _) = self.v128_into_f32x4(v, i)?;
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.x86_64.cvtps2udq128,
+                        &[
+                            v.into(),
+                            self.intrinsics.i32x4_ty.const_zero().into(),
+                            self.intrinsics.i8_ty.const_int(0xff, false).into(),
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
+                );
+                self.state.push1(res);
+            }
+            Operator::I32x4TruncSatF32x4U | Operator::I32x4RelaxedTruncF32x4U => {
                 let (v, i) = self.state.pop1_extra()?;
                 let v = self.apply_pending_canonicalization(v, i)?;
                 let v = v.into_int_value();
@@ -8215,13 +8954,67 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 )?;
                 self.state.push1(res);
             }
-            Operator::I32x4TruncSatF64x2SZero | Operator::I32x4TruncSatF64x2UZero => {
+            Operator::I32x4RelaxedTruncF64x2SZero
+                if self.cpu_features.contains(CpuFeature::SSE2) =>
+            {
+                let (v, i) = self.state.pop1_extra()?;
+                let (v, _) = self.v128_into_f64x2(v, i)?;
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.x86_64.cvtpd2dq,
+                        &[v.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
+                );
+                self.state.push1(res);
+            }
+            Operator::I32x4RelaxedTruncF64x2UZero
+                if self.cpu_features.contains(CpuFeature::AVX512F)
+                    && self.cpu_features.contains(CpuFeature::AVX512VL) =>
+            {
+                let (v, i) = self.state.pop1_extra()?;
+                let (v, _) = self.v128_into_f64x2(v, i)?;
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.x86_64.cvtpd2udq128,
+                        &[
+                            v.into(),
+                            self.intrinsics.i32x4_ty.const_zero().into(),
+                            self.intrinsics.i8_ty.const_int(0xff, false).into(),
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
+                );
+                self.state.push1(res);
+            }
+            Operator::I32x4TruncSatF64x2SZero
+            | Operator::I32x4TruncSatF64x2UZero
+            | Operator::I32x4RelaxedTruncF64x2SZero
+            | Operator::I32x4RelaxedTruncF64x2UZero => {
                 let ((min, max), (cmp_min, cmp_max)) = match op {
                     Operator::I32x4TruncSatF64x2SZero => (
                         (i32::MIN as u64, i32::MAX as u64),
                         (LEF64_GEQ_I32_MIN, GEF64_LEQ_I32_MAX),
                     ),
                     Operator::I32x4TruncSatF64x2UZero => (
+                        (u32::MIN as u64, u32::MAX as u64),
+                        (LEF64_GEQ_U32_MIN, GEF64_LEQ_U32_MAX),
+                    ),
+                    Operator::I32x4RelaxedTruncF64x2SZero => (
+                        (i32::MIN as u64, i32::MAX as u64),
+                        (LEF64_GEQ_I32_MIN, GEF64_LEQ_I32_MAX),
+                    ),
+                    Operator::I32x4RelaxedTruncF64x2UZero => (
                         (u32::MIN as u64, u32::MAX as u64),
                         (LEF64_GEQ_U32_MIN, GEF64_LEQ_U32_MAX),
                     ),
@@ -8516,29 +9309,31 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             Operator::F32DemoteF64 => {
                 let v = self.state.pop1()?;
                 let v = v.into_float_value();
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.fptrunc_f64,
-                    &[
-                        v.into(),
-                        self.intrinsics.fp_rounding_md,
-                        self.intrinsics.fp_exception_md,
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.fptrunc_f64,
+                        &[
+                            v.into(),
+                            self.intrinsics.fp_rounding_md,
+                            self.intrinsics.fp_exception_md,
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(res, ExtraInfo::pending_f32_nan());
             }
             Operator::F64PromoteF32 => {
                 let v = self.state.pop1()?;
                 let v = v.into_float_value();
-                let res = err!(self.builder.build_call(
-                    self.intrinsics.fpext_f32,
-                    &[v.into(), self.intrinsics.fp_exception_md],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.fpext_f32,
+                        &[v.into(), self.intrinsics.fp_exception_md],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 self.state.push1_extra(res, ExtraInfo::pending_f64_nan());
             }
             Operator::F32ConvertI32S | Operator::F32ConvertI64S => {
@@ -8702,7 +9497,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             //     let res = self
             //         .builder
             //         .build_signed_int_to_float(v, self.intrinsics.f64x2_ty, "");
-            //     let res = chck_err!(self.builder.build_bit_cast(res, self.intrinsics.i128_ty, ""));
+            //     let res = check_err!(self.builder.build_bit_cast(res, self.intrinsics.i128_ty, ""));
             //     self.state.push1(res);
             // }
             // Operator::F64x2ConvertI64x2U => {
@@ -8714,7 +9509,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             //     let res = self
             //         .builder
             //         .build_unsigned_int_to_float(v, self.intrinsics.f64x2_ty, "");
-            //     let res = chck_err!(self.builder.build_bit_cast(res, self.intrinsics.i128_ty, ""));
+            //     let res = check_err!(self.builder.build_bit_cast(res, self.intrinsics.i128_ty, ""));
             //     self.state.push1(res);
             // }
             Operator::I32ReinterpretF32 => {
@@ -8739,11 +9534,15 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let ret = err!(self.builder.build_bit_cast(v, self.intrinsics.f64_ty, ""));
                 self.state.push1_extra(ret, i);
             }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
 
-            /***************************
-             * Sign-extension operators.
-             * https://github.com/WebAssembly/sign-extension-ops/blob/master/proposals/sign-extension-ops/Overview.md
-             ***************************/
+    // Sign-extension operators.
+    // https://github.com/WebAssembly/sign-extension-ops/blob/master/proposals/sign-extension-ops/Overview.md
+    fn translate_sign_extension_operator(&mut self, op: Operator) -> Result<(), CompileError> {
+        match op {
             Operator::I32Extend8S => {
                 let value = self.state.pop1()?.into_int_value();
                 let narrow_value = err!(self.builder.build_int_truncate(
@@ -8814,149 +9613,53 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 ));
                 self.state.push1(extended_value);
             }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
 
-            /***************************
-             * Load and Store instructions.
-             * https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#load-and-store-instructions
-             ***************************/
+    // Load and Store instructions.
+    // https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#load-and-store-instructions
+    fn translate_memory_operator(&mut self, op: Operator) -> Result<(), CompileError> {
+        let vmctx = &self.ctx.basic().into_pointer_value();
+
+        match op {
             Operator::I32Load { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                let result = err!(self.builder.build_load(
-                    self.intrinsics.i32_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    result.as_instruction_value().unwrap(),
-                )?;
+                let result =
+                    self.build_annotated_load(self.intrinsics.i32_ty, offset, memarg, 1)?;
                 self.state.push1(result);
             }
             Operator::I64Load { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                let result = err!(self.builder.build_load(
-                    self.intrinsics.i64_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    result.as_instruction_value().unwrap(),
-                )?;
+                let result =
+                    self.build_annotated_load(self.intrinsics.i64_ty, offset, memarg, 1)?;
                 self.state.push1(result);
             }
             Operator::F32Load { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                let result = err!(self.builder.build_load(
-                    self.intrinsics.f32_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    result.as_instruction_value().unwrap(),
-                )?;
+                let result =
+                    self.build_annotated_load(self.intrinsics.f32_ty, offset, memarg, 1)?;
                 self.state.push1(result);
             }
             Operator::F64Load { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                let result = err!(self.builder.build_load(
-                    self.intrinsics.f64_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    result.as_instruction_value().unwrap(),
-                )?;
+                let result =
+                    self.build_annotated_load(self.intrinsics.f64_ty, offset, memarg, 1)?;
                 self.state.push1(result);
             }
             Operator::V128Load { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    16,
-                )?;
-                let result = err!(self.builder.build_load(
-                    self.intrinsics.i128_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    result.as_instruction_value().unwrap(),
-                )?;
+                let result =
+                    self.build_annotated_load(self.intrinsics.i128_ty, offset, memarg, 1)?;
                 self.state.push1(result);
             }
             Operator::V128Load8Lane { ref memarg, lane } => {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, _i) = self.v128_into_i8x16(v, i)?;
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(memarg.memory);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                let element = err!(self.builder.build_load(
-                    self.intrinsics.i8_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    element.as_instruction_value().unwrap(),
-                )?;
+                let element =
+                    self.build_annotated_load(self.intrinsics.i8_ty, offset, memarg, 1)?;
                 let idx = self.intrinsics.i32_ty.const_int(lane.into(), false);
                 let res = err!(self.builder.build_insert_element(v, element, idx, ""));
                 let res = err!(
@@ -8969,25 +9672,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, i) = self.v128_into_i16x8(v, i)?;
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(memarg.memory);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                let element = err!(self.builder.build_load(
-                    self.intrinsics.i16_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    element.as_instruction_value().unwrap(),
-                )?;
+                let element =
+                    self.build_annotated_load(self.intrinsics.i16_ty, offset, memarg, 1)?;
                 let idx = self.intrinsics.i32_ty.const_int(lane.into(), false);
                 let res = err!(self.builder.build_insert_element(v, element, idx, ""));
                 let res = err!(
@@ -9000,25 +9686,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, i) = self.v128_into_i32x4(v, i)?;
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(memarg.memory);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                let element = err!(self.builder.build_load(
-                    self.intrinsics.i32_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    element.as_instruction_value().unwrap(),
-                )?;
+                let element =
+                    self.build_annotated_load(self.intrinsics.i32_ty, offset, memarg, 1)?;
                 let idx = self.intrinsics.i32_ty.const_int(lane.into(), false);
                 let res = err!(self.builder.build_insert_element(v, element, idx, ""));
                 let res = err!(
@@ -9031,25 +9700,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, i) = self.v128_into_i64x2(v, i)?;
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(memarg.memory);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                let element = err!(self.builder.build_load(
-                    self.intrinsics.i64_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    element.as_instruction_value().unwrap(),
-                )?;
+                let element =
+                    self.build_annotated_load(self.intrinsics.i64_ty, offset, memarg, 1)?;
                 let idx = self.intrinsics.i32_ty.const_int(lane.into(), false);
                 let res = err!(self.builder.build_insert_element(v, element, idx, ""));
                 let res = err!(
@@ -9062,268 +9714,67 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             Operator::I32Store { ref memarg } => {
                 let value = self.state.pop1()?;
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                let dead_load = err!(self.builder.build_load(
-                    self.intrinsics.i32_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    dead_load.as_instruction_value().unwrap(),
-                )?;
-                let store = err!(self.builder.build_store(effective_address, value));
-                self.annotate_user_memaccess(memory_index, memarg, 1, store)?;
+                self.build_annotated_store(self.intrinsics.i32_ty, offset, value, memarg, 1)?;
             }
             Operator::I64Store { ref memarg } => {
                 let value = self.state.pop1()?;
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                let dead_load = err!(self.builder.build_load(
-                    self.intrinsics.i64_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    dead_load.as_instruction_value().unwrap(),
-                )?;
-                let store = err!(self.builder.build_store(effective_address, value));
-                self.annotate_user_memaccess(memory_index, memarg, 1, store)?;
+                self.build_annotated_store(self.intrinsics.i64_ty, offset, value, memarg, 1)?;
             }
             Operator::F32Store { ref memarg } => {
                 let (v, i) = self.state.pop1_extra()?;
                 let v = self.apply_pending_canonicalization(v, i)?;
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                let dead_load = err!(self.builder.build_load(
-                    self.intrinsics.f32_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    dead_load.as_instruction_value().unwrap(),
-                )?;
-                let store = err!(self.builder.build_store(effective_address, v));
-                self.annotate_user_memaccess(memory_index, memarg, 1, store)?;
+                self.build_annotated_store(self.intrinsics.f32_ty, offset, v, memarg, 1)?;
             }
             Operator::F64Store { ref memarg } => {
                 let (v, i) = self.state.pop1_extra()?;
                 let v = self.apply_pending_canonicalization(v, i)?;
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                let dead_load = err!(self.builder.build_load(
-                    self.intrinsics.f64_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    dead_load.as_instruction_value().unwrap(),
-                )?;
-                let store = err!(self.builder.build_store(effective_address, v));
-                self.annotate_user_memaccess(memory_index, memarg, 1, store)?;
+                self.build_annotated_store(self.intrinsics.f64_ty, offset, v, memarg, 1)?;
             }
             Operator::V128Store { ref memarg } => {
                 let (v, i) = self.state.pop1_extra()?;
                 let v = self.apply_pending_canonicalization(v, i)?;
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    16,
-                )?;
-                let dead_load = err!(self.builder.build_load(
-                    self.intrinsics.i128_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    dead_load.as_instruction_value().unwrap(),
-                )?;
-                let store = err!(self.builder.build_store(effective_address, v));
-                self.annotate_user_memaccess(memory_index, memarg, 1, store)?;
+                self.build_annotated_store(self.intrinsics.i128_ty, offset, v, memarg, 1)?;
             }
             Operator::V128Store8Lane { ref memarg, lane } => {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, _i) = self.v128_into_i8x16(v, i)?;
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(memarg.memory);
-
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                let dead_load = err!(self.builder.build_load(
-                    self.intrinsics.i8_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    dead_load.as_instruction_value().unwrap(),
-                )?;
                 let idx = self.intrinsics.i32_ty.const_int(lane.into(), false);
                 let val = err!(self.builder.build_extract_element(v, idx, ""));
-                let store = err!(self.builder.build_store(effective_address, val));
-                self.annotate_user_memaccess(memory_index, memarg, 1, store)?;
+                self.build_annotated_store(self.intrinsics.i8_ty, offset, val, memarg, 1)?;
             }
             Operator::V128Store16Lane { ref memarg, lane } => {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, _i) = self.v128_into_i16x8(v, i)?;
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(memarg.memory);
-
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                let dead_load = err!(self.builder.build_load(
-                    self.intrinsics.i16_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    dead_load.as_instruction_value().unwrap(),
-                )?;
                 let idx = self.intrinsics.i32_ty.const_int(lane.into(), false);
                 let val = err!(self.builder.build_extract_element(v, idx, ""));
-                let store = err!(self.builder.build_store(effective_address, val));
-                self.annotate_user_memaccess(memory_index, memarg, 1, store)?;
+                self.build_annotated_store(self.intrinsics.i16_ty, offset, val, memarg, 1)?;
             }
             Operator::V128Store32Lane { ref memarg, lane } => {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, _i) = self.v128_into_i32x4(v, i)?;
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(memarg.memory);
-
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                let dead_load = err!(self.builder.build_load(
-                    self.intrinsics.i32_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    dead_load.as_instruction_value().unwrap(),
-                )?;
                 let idx = self.intrinsics.i32_ty.const_int(lane.into(), false);
                 let val = err!(self.builder.build_extract_element(v, idx, ""));
-                let store = err!(self.builder.build_store(effective_address, val));
-                self.annotate_user_memaccess(memory_index, memarg, 1, store)?;
+                self.build_annotated_store(self.intrinsics.i32_ty, offset, val, memarg, 1)?;
             }
             Operator::V128Store64Lane { ref memarg, lane } => {
                 let (v, i) = self.state.pop1_extra()?;
                 let (v, _i) = self.v128_into_i64x2(v, i)?;
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(memarg.memory);
-
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                let dead_load = err!(self.builder.build_load(
-                    self.intrinsics.i64_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    dead_load.as_instruction_value().unwrap(),
-                )?;
                 let idx = self.intrinsics.i32_ty.const_int(lane.into(), false);
                 let val = err!(self.builder.build_extract_element(v, idx, ""));
-                let store = err!(self.builder.build_store(effective_address, val));
-                self.annotate_user_memaccess(memory_index, memarg, 1, store)?;
+                self.build_annotated_store(self.intrinsics.i64_ty, offset, val, memarg, 1)?;
             }
             Operator::I32Load8S { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                let narrow_result = err!(self.builder.build_load(
-                    self.intrinsics.i8_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    narrow_result.as_instruction_value().unwrap(),
-                )?;
+                let narrow_result =
+                    self.build_annotated_load(self.intrinsics.i8_ty, offset, memarg, 1)?;
                 let result = err!(self.builder.build_int_s_extend(
                     narrow_result.into_int_value(),
                     self.intrinsics.i32_ty,
@@ -9333,25 +9784,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::I32Load16S { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                let narrow_result = err!(self.builder.build_load(
-                    self.intrinsics.i16_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    narrow_result.as_instruction_value().unwrap(),
-                )?;
+                let narrow_result =
+                    self.build_annotated_load(self.intrinsics.i16_ty, offset, memarg, 1)?;
                 let result = err!(self.builder.build_int_s_extend(
                     narrow_result.into_int_value(),
                     self.intrinsics.i32_ty,
@@ -9361,28 +9795,10 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::I64Load8S { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                let narrow_result = err!(self.builder.build_load(
-                    self.intrinsics.i8_ty,
-                    effective_address,
-                    ""
-                ))
-                .into_int_value();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    narrow_result.as_instruction_value().unwrap(),
-                )?;
+                let narrow_result =
+                    self.build_annotated_load(self.intrinsics.i8_ty, offset, memarg, 1)?;
                 let result = err!(self.builder.build_int_s_extend(
-                    narrow_result,
+                    narrow_result.into_int_value(),
                     self.intrinsics.i64_ty,
                     ""
                 ));
@@ -9390,28 +9806,10 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::I64Load16S { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                let narrow_result = err!(self.builder.build_load(
-                    self.intrinsics.i16_ty,
-                    effective_address,
-                    ""
-                ))
-                .into_int_value();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    narrow_result.as_instruction_value().unwrap(),
-                )?;
+                let narrow_result =
+                    self.build_annotated_load(self.intrinsics.i16_ty, offset, memarg, 1)?;
                 let result = err!(self.builder.build_int_s_extend(
-                    narrow_result,
+                    narrow_result.into_int_value(),
                     self.intrinsics.i64_ty,
                     ""
                 ));
@@ -9419,25 +9817,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::I64Load32S { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                let narrow_result = err!(self.builder.build_load(
-                    self.intrinsics.i32_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    narrow_result.as_instruction_value().unwrap(),
-                )?;
+                let narrow_result =
+                    self.build_annotated_load(self.intrinsics.i32_ty, offset, memarg, 1)?;
                 let result = err!(self.builder.build_int_s_extend(
                     narrow_result.into_int_value(),
                     self.intrinsics.i64_ty,
@@ -9448,25 +9829,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
 
             Operator::I32Load8U { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                let narrow_result = err!(self.builder.build_load(
-                    self.intrinsics.i8_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    narrow_result.as_instruction_value().unwrap(),
-                )?;
+                let narrow_result =
+                    self.build_annotated_load(self.intrinsics.i8_ty, offset, memarg, 1)?;
                 let result = err!(self.builder.build_int_z_extend(
                     narrow_result.into_int_value(),
                     self.intrinsics.i32_ty,
@@ -9476,25 +9840,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::I32Load16U { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                let narrow_result = err!(self.builder.build_load(
-                    self.intrinsics.i16_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    narrow_result.as_instruction_value().unwrap(),
-                )?;
+                let narrow_result =
+                    self.build_annotated_load(self.intrinsics.i16_ty, offset, memarg, 1)?;
                 let result = err!(self.builder.build_int_z_extend(
                     narrow_result.into_int_value(),
                     self.intrinsics.i32_ty,
@@ -9504,25 +9851,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::I64Load8U { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                let narrow_result = err!(self.builder.build_load(
-                    self.intrinsics.i8_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    narrow_result.as_instruction_value().unwrap(),
-                )?;
+                let narrow_result =
+                    self.build_annotated_load(self.intrinsics.i8_ty, offset, memarg, 1)?;
                 let result = err!(self.builder.build_int_z_extend(
                     narrow_result.into_int_value(),
                     self.intrinsics.i64_ty,
@@ -9532,25 +9862,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::I64Load16U { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                let narrow_result = err!(self.builder.build_load(
-                    self.intrinsics.i16_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    narrow_result.as_instruction_value().unwrap(),
-                )?;
+                let narrow_result =
+                    self.build_annotated_load(self.intrinsics.i16_ty, offset, memarg, 1)?;
                 let result = err!(self.builder.build_int_z_extend(
                     narrow_result.into_int_value(),
                     self.intrinsics.i64_ty,
@@ -9560,25 +9873,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::I64Load32U { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                let narrow_result = err!(self.builder.build_load(
-                    self.intrinsics.i32_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    narrow_result.as_instruction_value().unwrap(),
-                )?;
+                let narrow_result =
+                    self.build_annotated_load(self.intrinsics.i32_ty, offset, memarg, 1)?;
                 let result = err!(self.builder.build_int_z_extend(
                     narrow_result.into_int_value(),
                     self.intrinsics.i64_ty,
@@ -9590,92 +9886,50 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             Operator::I32Store8 { ref memarg } | Operator::I64Store8 { ref memarg } => {
                 let value = self.state.pop1()?.into_int_value();
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                let dead_load = err!(self.builder.build_load(
-                    self.intrinsics.i8_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    dead_load.as_instruction_value().unwrap(),
-                )?;
                 let narrow_value = err!(self.builder.build_int_truncate(
                     value,
                     self.intrinsics.i8_ty,
                     ""
                 ));
-                let store = err!(self.builder.build_store(effective_address, narrow_value));
-                self.annotate_user_memaccess(memory_index, memarg, 1, store)?;
+                self.build_annotated_store(
+                    self.intrinsics.i8_ty,
+                    offset,
+                    narrow_value.into(),
+                    memarg,
+                    1,
+                )?;
             }
             Operator::I32Store16 { ref memarg } | Operator::I64Store16 { ref memarg } => {
                 let value = self.state.pop1()?.into_int_value();
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                let dead_load = err!(self.builder.build_load(
-                    self.intrinsics.i16_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    dead_load.as_instruction_value().unwrap(),
-                )?;
                 let narrow_value = err!(self.builder.build_int_truncate(
                     value,
                     self.intrinsics.i16_ty,
                     ""
                 ));
-                let store = err!(self.builder.build_store(effective_address, narrow_value));
-                self.annotate_user_memaccess(memory_index, memarg, 1, store)?;
+                self.build_annotated_store(
+                    self.intrinsics.i16_ty,
+                    offset,
+                    narrow_value.into(),
+                    memarg,
+                    1,
+                )?;
             }
             Operator::I64Store32 { ref memarg } => {
                 let value = self.state.pop1()?.into_int_value();
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                let dead_load = err!(self.builder.build_load(
-                    self.intrinsics.i32_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    dead_load.as_instruction_value().unwrap(),
-                )?;
                 let narrow_value = err!(self.builder.build_int_truncate(
                     value,
                     self.intrinsics.i32_ty,
                     ""
                 ));
-                let store = err!(self.builder.build_store(effective_address, narrow_value));
-                self.annotate_user_memaccess(memory_index, memarg, 1, store)?;
+                self.build_annotated_store(
+                    self.intrinsics.i32_ty,
+                    offset,
+                    narrow_value.into(),
+                    memarg,
+                    1,
+                )?;
             }
             Operator::I8x16Neg => {
                 let (v, i) = self.state.pop1_extra()?;
@@ -9755,7 +10009,10 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 };
                 let (v, i) = self.state.pop1_extra()?;
                 let v = self.apply_pending_canonicalization(v, i)?.into_int_value();
-                let lane_int_ty = self.context.custom_width_int_type(vec_ty.get_size());
+                let lane_int_ty = self
+                    .context
+                    .custom_width_int_type(NonZero::new(vec_ty.get_size()).unwrap())
+                    .unwrap();
                 let vec = err!(self.builder.build_bit_cast(v, vec_ty, "vec")).into_vector_value();
                 let mask = err!(self.builder.build_int_compare(
                     IntPredicate::NE,
@@ -9964,7 +10221,28 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 };
                 self.state.push1_extra(res, info);
             }
-            Operator::I8x16Swizzle => {
+            Operator::I8x16RelaxedSwizzle if self.cpu_features.contains(CpuFeature::SSSE3) => {
+                let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
+                let v1 = self.apply_pending_canonicalization(v1, i1)?;
+                let v2 = self.apply_pending_canonicalization(v2, i2)?;
+
+                let (v1, _) = self.v128_into_i8x16(v1, i1)?;
+                let (v2, _) = self.v128_into_i8x16(v2, i2)?;
+                let res = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.x86_64.pshufb128,
+                        &[v1.into(), v2.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let res = err!(
+                    self.builder
+                        .build_bit_cast(res, self.intrinsics.i128_ty, "")
+                );
+                self.state.push1(res);
+            }
+            Operator::I8x16Swizzle | Operator::I8x16RelaxedSwizzle => {
                 let ((v1, i1), (v2, i2)) = self.state.pop2_extra()?;
                 let v1 = self.apply_pending_canonicalization(v1, i1)?;
                 let v1 = err!(
@@ -10059,19 +10337,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::V128Load8x8S { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                let v = err!(self.builder.build_load(
-                    self.intrinsics.i64_ty,
-                    effective_address,
-                    ""
-                ));
+                let v = self.build_annotated_load(self.intrinsics.i64_ty, offset, memarg, 1)?;
                 let v = err!(
                     self.builder
                         .build_bit_cast(v, self.intrinsics.i8_ty.vec_type(8), "")
@@ -10089,19 +10355,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::V128Load8x8U { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                let v = err!(self.builder.build_load(
-                    self.intrinsics.i64_ty,
-                    effective_address,
-                    ""
-                ));
+                let v = self.build_annotated_load(self.intrinsics.i64_ty, offset, memarg, 1)?;
                 let v = err!(
                     self.builder
                         .build_bit_cast(v, self.intrinsics.i8_ty.vec_type(8), "")
@@ -10119,19 +10373,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::V128Load16x4S { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                let v = err!(self.builder.build_load(
-                    self.intrinsics.i64_ty,
-                    effective_address,
-                    ""
-                ));
+                let v = self.build_annotated_load(self.intrinsics.i64_ty, offset, memarg, 1)?;
                 let v = err!(self.builder.build_bit_cast(
                     v,
                     self.intrinsics.i16_ty.vec_type(4),
@@ -10150,19 +10392,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::V128Load16x4U { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                let v = err!(self.builder.build_load(
-                    self.intrinsics.i64_ty,
-                    effective_address,
-                    ""
-                ));
+                let v = self.build_annotated_load(self.intrinsics.i64_ty, offset, memarg, 1)?;
                 let v = err!(self.builder.build_bit_cast(
                     v,
                     self.intrinsics.i16_ty.vec_type(4),
@@ -10181,19 +10411,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::V128Load32x2S { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                let v = err!(self.builder.build_load(
-                    self.intrinsics.i64_ty,
-                    effective_address,
-                    ""
-                ));
+                let v = self.build_annotated_load(self.intrinsics.i64_ty, offset, memarg, 1)?;
                 let v = err!(self.builder.build_bit_cast(
                     v,
                     self.intrinsics.i32_ty.vec_type(2),
@@ -10212,19 +10430,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::V128Load32x2U { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                let v = err!(self.builder.build_load(
-                    self.intrinsics.i64_ty,
-                    effective_address,
-                    ""
-                ));
+                let v = self.build_annotated_load(self.intrinsics.i64_ty, offset, memarg, 1)?;
                 let v = err!(self.builder.build_bit_cast(
                     v,
                     self.intrinsics.i32_ty.vec_type(2),
@@ -10243,27 +10449,10 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::V128Load32Zero { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                let elem = err!(self.builder.build_load(
-                    self.intrinsics.i32_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    elem.as_instruction_value().unwrap(),
-                )?;
+                let element =
+                    self.build_annotated_load(self.intrinsics.i32_ty, offset, memarg, 1)?;
                 let res = err!(self.builder.build_int_z_extend(
-                    elem.into_int_value(),
+                    element.into_int_value(),
                     self.intrinsics.i128_ty,
                     "",
                 ));
@@ -10271,27 +10460,10 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::V128Load64Zero { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                let elem = err!(self.builder.build_load(
-                    self.intrinsics.i64_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    elem.as_instruction_value().unwrap(),
-                )?;
+                let element =
+                    self.build_annotated_load(self.intrinsics.i64_ty, offset, memarg, 1)?;
                 let res = err!(self.builder.build_int_z_extend(
-                    elem.into_int_value(),
+                    element.into_int_value(),
                     self.intrinsics.i128_ty,
                     "",
                 ));
@@ -10299,26 +10471,9 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::V128Load8Splat { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                let elem = err!(self.builder.build_load(
-                    self.intrinsics.i8_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    elem.as_instruction_value().unwrap(),
-                )?;
-                let res = self.splat_vector(elem, self.intrinsics.i8x16_ty)?;
+                let element =
+                    self.build_annotated_load(self.intrinsics.i8_ty, offset, memarg, 1)?;
+                let res = self.splat_vector(element, self.intrinsics.i8x16_ty)?;
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -10327,26 +10482,9 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::V128Load16Splat { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                let elem = err!(self.builder.build_load(
-                    self.intrinsics.i16_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    elem.as_instruction_value().unwrap(),
-                )?;
-                let res = self.splat_vector(elem, self.intrinsics.i16x8_ty)?;
+                let element =
+                    self.build_annotated_load(self.intrinsics.i16_ty, offset, memarg, 1)?;
+                let res = self.splat_vector(element, self.intrinsics.i16x8_ty)?;
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -10355,26 +10493,9 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::V128Load32Splat { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                let elem = err!(self.builder.build_load(
-                    self.intrinsics.i32_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    elem.as_instruction_value().unwrap(),
-                )?;
-                let res = self.splat_vector(elem, self.intrinsics.i32x4_ty)?;
+                let element =
+                    self.build_annotated_load(self.intrinsics.i32_ty, offset, memarg, 1)?;
+                let res = self.splat_vector(element, self.intrinsics.i32x4_ty)?;
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
@@ -10383,2150 +10504,14 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
             }
             Operator::V128Load64Splat { ref memarg } => {
                 let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                let elem = err!(self.builder.build_load(
-                    self.intrinsics.i64_ty,
-                    effective_address,
-                    ""
-                ));
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    1,
-                    elem.as_instruction_value().unwrap(),
-                )?;
-                let res = self.splat_vector(elem, self.intrinsics.i64x2_ty)?;
+                let element =
+                    self.build_annotated_load(self.intrinsics.i64_ty, offset, memarg, 1)?;
+                let res = self.splat_vector(element, self.intrinsics.i64x2_ty)?;
                 let res = err!(
                     self.builder
                         .build_bit_cast(res, self.intrinsics.i128_ty, "")
                 );
                 self.state.push1(res);
-            }
-            Operator::AtomicFence => {
-                // Fence is a nop.
-                //
-                // Fence was added to preserve information about fences from
-                // source languages. If in the future Wasm extends the memory
-                // model, and if we hadn't recorded what fences used to be there,
-                // it would lead to data races that weren't present in the
-                // original source language.
-            }
-            Operator::I32AtomicLoad { ref memarg } => {
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let result = err!(self.builder.build_load(
-                    self.intrinsics.i32_ty,
-                    effective_address,
-                    "atomic_load"
-                ));
-                let load = result.as_instruction_value().unwrap();
-                self.annotate_user_memaccess(memory_index, memarg, 4, load)?;
-                load.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
-                    .unwrap();
-                self.state.push1(result);
-            }
-            Operator::I64AtomicLoad { ref memarg } => {
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 8)?;
-                let result = err!(self.builder.build_load(
-                    self.intrinsics.i64_ty,
-                    effective_address,
-                    ""
-                ));
-                let load = result.as_instruction_value().unwrap();
-                self.annotate_user_memaccess(memory_index, memarg, 8, load)?;
-                load.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
-                    .unwrap();
-                self.state.push1(result);
-            }
-            Operator::I32AtomicLoad8U { ref memarg } => {
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 1)?;
-                let narrow_result = err!(self.builder.build_load(
-                    self.intrinsics.i8_ty,
-                    effective_address,
-                    ""
-                ))
-                .into_int_value();
-                let load = narrow_result.as_instruction_value().unwrap();
-                self.annotate_user_memaccess(memory_index, memarg, 1, load)?;
-                load.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
-                    .unwrap();
-                let result = err!(self.builder.build_int_z_extend(
-                    narrow_result,
-                    self.intrinsics.i32_ty,
-                    ""
-                ));
-                self.state.push1_extra(result, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I32AtomicLoad16U { ref memarg } => {
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_result = err!(self.builder.build_load(
-                    self.intrinsics.i16_ty,
-                    effective_address,
-                    ""
-                ))
-                .into_int_value();
-                let load = narrow_result.as_instruction_value().unwrap();
-                self.annotate_user_memaccess(memory_index, memarg, 2, load)?;
-                load.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
-                    .unwrap();
-                let result = err!(self.builder.build_int_z_extend(
-                    narrow_result,
-                    self.intrinsics.i32_ty,
-                    ""
-                ));
-                self.state.push1_extra(result, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I64AtomicLoad8U { ref memarg } => {
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 1)?;
-                let narrow_result = err!(self.builder.build_load(
-                    self.intrinsics.i8_ty,
-                    effective_address,
-                    ""
-                ))
-                .into_int_value();
-                let load = narrow_result.as_instruction_value().unwrap();
-                self.annotate_user_memaccess(memory_index, memarg, 1, load)?;
-                load.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
-                    .unwrap();
-                let result = err!(self.builder.build_int_z_extend(
-                    narrow_result,
-                    self.intrinsics.i64_ty,
-                    ""
-                ));
-                self.state.push1_extra(result, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicLoad16U { ref memarg } => {
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_result = err!(self.builder.build_load(
-                    self.intrinsics.i16_ty,
-                    effective_address,
-                    ""
-                ))
-                .into_int_value();
-                let load = narrow_result.as_instruction_value().unwrap();
-                self.annotate_user_memaccess(memory_index, memarg, 2, load)?;
-                load.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
-                    .unwrap();
-                let result = err!(self.builder.build_int_z_extend(
-                    narrow_result,
-                    self.intrinsics.i64_ty,
-                    ""
-                ));
-                self.state.push1_extra(result, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicLoad32U { ref memarg } => {
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let narrow_result = err!(self.builder.build_load(
-                    self.intrinsics.i32_ty,
-                    effective_address,
-                    ""
-                ))
-                .into_int_value();
-                let load = narrow_result.as_instruction_value().unwrap();
-                self.annotate_user_memaccess(memory_index, memarg, 4, load)?;
-                load.set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
-                    .unwrap();
-                let result = err!(self.builder.build_int_z_extend(
-                    narrow_result,
-                    self.intrinsics.i64_ty,
-                    ""
-                ));
-                self.state.push1_extra(result, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I32AtomicStore { ref memarg } => {
-                let value = self.state.pop1()?;
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let store = err!(self.builder.build_store(effective_address, value));
-                self.annotate_user_memaccess(memory_index, memarg, 4, store)?;
-                store
-                    .set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
-                    .unwrap();
-            }
-            Operator::I64AtomicStore { ref memarg } => {
-                let value = self.state.pop1()?;
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 8)?;
-                let store = err!(self.builder.build_store(effective_address, value));
-                self.annotate_user_memaccess(memory_index, memarg, 8, store)?;
-                store
-                    .set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
-                    .unwrap();
-            }
-            Operator::I32AtomicStore8 { ref memarg } | Operator::I64AtomicStore8 { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 1)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let store = err!(self.builder.build_store(effective_address, narrow_value));
-                self.annotate_user_memaccess(memory_index, memarg, 1, store)?;
-                store
-                    .set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
-                    .unwrap();
-            }
-            Operator::I32AtomicStore16 { ref memarg }
-            | Operator::I64AtomicStore16 { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let store = err!(self.builder.build_store(effective_address, narrow_value));
-                self.annotate_user_memaccess(memory_index, memarg, 2, store)?;
-                store
-                    .set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
-                    .unwrap();
-            }
-            Operator::I64AtomicStore32 { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i32_ty,
-                    ""
-                ));
-                let store = err!(self.builder.build_store(effective_address, narrow_value));
-                self.annotate_user_memaccess(memory_index, memarg, 4, store)?;
-                store
-                    .set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
-                    .unwrap();
-            }
-            Operator::I32AtomicRmw8AddU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 1)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Add,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                tbaa_label(
-                    self.module,
-                    self.intrinsics,
-                    format!("memory {}", memory_index.as_u32()),
-                    old.as_instruction_value().unwrap(),
-                );
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i32_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I32AtomicRmw16AddU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Add,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                tbaa_label(
-                    self.module,
-                    self.intrinsics,
-                    format!("memory {}", memory_index.as_u32()),
-                    old.as_instruction_value().unwrap(),
-                );
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i32_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I32AtomicRmwAdd { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Add,
-                        effective_address,
-                        value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                tbaa_label(
-                    self.module,
-                    self.intrinsics,
-                    format!("memory {}", memory_index.as_u32()),
-                    old.as_instruction_value().unwrap(),
-                );
-                self.state.push1(old);
-            }
-            Operator::I64AtomicRmw8AddU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 1)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Add,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmw16AddU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Add,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmw32AddU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i32_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Add,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmwAdd { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 8)?;
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Add,
-                        effective_address,
-                        value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                self.state.push1(old);
-            }
-            Operator::I32AtomicRmw8SubU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 1)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Sub,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i32_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I32AtomicRmw16SubU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Sub,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i32_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I32AtomicRmwSub { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Sub,
-                        effective_address,
-                        value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                self.state.push1(old);
-            }
-            Operator::I64AtomicRmw8SubU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 1)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Sub,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I64AtomicRmw16SubU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Sub,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmw32SubU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i32_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Sub,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmwSub { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 8)?;
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Sub,
-                        effective_address,
-                        value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                self.state.push1(old);
-            }
-            Operator::I32AtomicRmw8AndU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 1)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::And,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i32_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I32AtomicRmw16AndU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::And,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i32_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I32AtomicRmwAnd { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::And,
-                        effective_address,
-                        value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                self.state.push1(old);
-            }
-            Operator::I64AtomicRmw8AndU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 1)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::And,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmw16AndU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::And,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmw32AndU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i32_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::And,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmwAnd { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 8)?;
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::And,
-                        effective_address,
-                        value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                self.state.push1(old);
-            }
-            Operator::I32AtomicRmw8OrU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 1)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Or,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i32_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I32AtomicRmw16OrU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Or,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i32_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I32AtomicRmwOr { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Or,
-                        effective_address,
-                        value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i32_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I64AtomicRmw8OrU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 1)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Or,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmw16OrU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Or,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmw32OrU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i32_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Or,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmwOr { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 8)?;
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Or,
-                        effective_address,
-                        value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                self.state.push1(old);
-            }
-            Operator::I32AtomicRmw8XorU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Xor,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i32_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I32AtomicRmw16XorU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Xor,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i32_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I32AtomicRmwXor { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Xor,
-                        effective_address,
-                        value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                self.state.push1(old);
-            }
-            Operator::I64AtomicRmw8XorU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 1)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Xor,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmw16XorU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Xor,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmw32XorU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i32_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Xor,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmwXor { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 8)?;
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Xor,
-                        effective_address,
-                        value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                self.state.push1(old);
-            }
-            Operator::I32AtomicRmw8XchgU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 1)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Xchg,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i32_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I32AtomicRmw16XchgU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Xchg,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i32_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I32AtomicRmwXchg { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Xchg,
-                        effective_address,
-                        value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                self.state.push1(old);
-            }
-            Operator::I64AtomicRmw8XchgU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 1)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Xchg,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmw16XchgU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Xchg,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmw32XchgU { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let narrow_value = err!(self.builder.build_int_truncate(
-                    value,
-                    self.intrinsics.i32_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Xchg,
-                        effective_address,
-                        narrow_value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmwXchg { ref memarg } => {
-                let value = self.state.pop1()?.into_int_value();
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 8)?;
-                let old = self
-                    .builder
-                    .build_atomicrmw(
-                        AtomicRMWBinOp::Xchg,
-                        effective_address,
-                        value,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                self.state.push1(old);
-            }
-            Operator::I32AtomicRmw8CmpxchgU { ref memarg } => {
-                let ((cmp, cmp_info), (new, new_info)) = self.state.pop2_extra()?;
-                let cmp = self.apply_pending_canonicalization(cmp, cmp_info)?;
-                let new = self.apply_pending_canonicalization(new, new_info)?;
-                let (cmp, new) = (cmp.into_int_value(), new.into_int_value());
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 1)?;
-                let narrow_cmp = err!(self.builder.build_int_truncate(
-                    cmp,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let narrow_new = err!(self.builder.build_int_truncate(
-                    new,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_cmpxchg(
-                        effective_address,
-                        narrow_cmp,
-                        narrow_new,
-                        AtomicOrdering::SequentiallyConsistent,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = self
-                    .builder
-                    .build_extract_value(old, 0, "")
-                    .unwrap()
-                    .into_int_value();
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i32_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I32AtomicRmw16CmpxchgU { ref memarg } => {
-                let ((cmp, cmp_info), (new, new_info)) = self.state.pop2_extra()?;
-                let cmp = self.apply_pending_canonicalization(cmp, cmp_info)?;
-                let new = self.apply_pending_canonicalization(new, new_info)?;
-                let (cmp, new) = (cmp.into_int_value(), new.into_int_value());
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_cmp = err!(self.builder.build_int_truncate(
-                    cmp,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let narrow_new = err!(self.builder.build_int_truncate(
-                    new,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_cmpxchg(
-                        effective_address,
-                        narrow_cmp,
-                        narrow_new,
-                        AtomicOrdering::SequentiallyConsistent,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = self
-                    .builder
-                    .build_extract_value(old, 0, "")
-                    .unwrap()
-                    .into_int_value();
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i32_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f32());
-            }
-            Operator::I32AtomicRmwCmpxchg { ref memarg } => {
-                let ((cmp, cmp_info), (new, new_info)) = self.state.pop2_extra()?;
-                let cmp = self.apply_pending_canonicalization(cmp, cmp_info)?;
-                let new = self.apply_pending_canonicalization(new, new_info)?;
-                let (cmp, new) = (cmp.into_int_value(), new.into_int_value());
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let old = self
-                    .builder
-                    .build_cmpxchg(
-                        effective_address,
-                        cmp,
-                        new,
-                        AtomicOrdering::SequentiallyConsistent,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(self.builder.build_extract_value(old, 0, ""));
-                self.state.push1(old);
-            }
-            Operator::I64AtomicRmw8CmpxchgU { ref memarg } => {
-                let ((cmp, cmp_info), (new, new_info)) = self.state.pop2_extra()?;
-                let cmp = self.apply_pending_canonicalization(cmp, cmp_info)?;
-                let new = self.apply_pending_canonicalization(new, new_info)?;
-                let (cmp, new) = (cmp.into_int_value(), new.into_int_value());
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    1,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 1)?;
-                let narrow_cmp = err!(self.builder.build_int_truncate(
-                    cmp,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let narrow_new = err!(self.builder.build_int_truncate(
-                    new,
-                    self.intrinsics.i8_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_cmpxchg(
-                        effective_address,
-                        narrow_cmp,
-                        narrow_new,
-                        AtomicOrdering::SequentiallyConsistent,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = self
-                    .builder
-                    .build_extract_value(old, 0, "")
-                    .unwrap()
-                    .into_int_value();
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmw16CmpxchgU { ref memarg } => {
-                let ((cmp, cmp_info), (new, new_info)) = self.state.pop2_extra()?;
-                let cmp = self.apply_pending_canonicalization(cmp, cmp_info)?;
-                let new = self.apply_pending_canonicalization(new, new_info)?;
-                let (cmp, new) = (cmp.into_int_value(), new.into_int_value());
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    2,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 2)?;
-                let narrow_cmp = err!(self.builder.build_int_truncate(
-                    cmp,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let narrow_new = err!(self.builder.build_int_truncate(
-                    new,
-                    self.intrinsics.i16_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_cmpxchg(
-                        effective_address,
-                        narrow_cmp,
-                        narrow_new,
-                        AtomicOrdering::SequentiallyConsistent,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = self
-                    .builder
-                    .build_extract_value(old, 0, "")
-                    .unwrap()
-                    .into_int_value();
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmw32CmpxchgU { ref memarg } => {
-                let ((cmp, cmp_info), (new, new_info)) = self.state.pop2_extra()?;
-                let cmp = self.apply_pending_canonicalization(cmp, cmp_info)?;
-                let new = self.apply_pending_canonicalization(new, new_info)?;
-                let (cmp, new) = (cmp.into_int_value(), new.into_int_value());
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    4,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 4)?;
-                let narrow_cmp = err!(self.builder.build_int_truncate(
-                    cmp,
-                    self.intrinsics.i32_ty,
-                    ""
-                ));
-                let narrow_new = err!(self.builder.build_int_truncate(
-                    new,
-                    self.intrinsics.i32_ty,
-                    ""
-                ));
-                let old = self
-                    .builder
-                    .build_cmpxchg(
-                        effective_address,
-                        narrow_cmp,
-                        narrow_new,
-                        AtomicOrdering::SequentiallyConsistent,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = self
-                    .builder
-                    .build_extract_value(old, 0, "")
-                    .unwrap()
-                    .into_int_value();
-                let old = err!(
-                    self.builder
-                        .build_int_z_extend(old, self.intrinsics.i64_ty, "")
-                );
-                self.state.push1_extra(old, ExtraInfo::arithmetic_f64());
-            }
-            Operator::I64AtomicRmwCmpxchg { ref memarg } => {
-                let ((cmp, cmp_info), (new, new_info)) = self.state.pop2_extra()?;
-                let cmp = self.apply_pending_canonicalization(cmp, cmp_info)?;
-                let new = self.apply_pending_canonicalization(new, new_info)?;
-                let (cmp, new) = (cmp.into_int_value(), new.into_int_value());
-                let offset = self.state.pop1()?.into_int_value();
-                let memory_index = MemoryIndex::from_u32(0);
-                let effective_address = self.resolve_memory_ptr(
-                    memory_index,
-                    memarg,
-                    self.intrinsics.ptr_ty,
-                    offset,
-                    8,
-                )?;
-                self.trap_if_misaligned(memarg, effective_address, 8)?;
-                let old = self
-                    .builder
-                    .build_cmpxchg(
-                        effective_address,
-                        cmp,
-                        new,
-                        AtomicOrdering::SequentiallyConsistent,
-                        AtomicOrdering::SequentiallyConsistent,
-                    )
-                    .unwrap();
-                self.annotate_user_memaccess(
-                    memory_index,
-                    memarg,
-                    0,
-                    old.as_instruction_value().unwrap(),
-                )?;
-                let old = err!(self.builder.build_extract_value(old, 0, ""));
-                self.state.push1(old);
             }
 
             Operator::MemoryGrow { mem } => {
@@ -12564,7 +10549,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let (dest, src, len) = self.state.pop3()?;
                 let mem = self.intrinsics.i32_ty.const_int(mem.into(), false);
                 let segment = self.intrinsics.i32_ty.const_int(data_index.into(), false);
-                err!(self.builder.build_call(
+                self.build_call_with_param_attributes(
                     self.intrinsics.memory_init,
                     &[
                         vmctx.as_basic_value_enum().into(),
@@ -12575,15 +10560,15 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                         len.into(),
                     ],
                     "",
-                ));
+                )?;
             }
             Operator::DataDrop { data_index } => {
                 let segment = self.intrinsics.i32_ty.const_int(data_index.into(), false);
-                err!(self.builder.build_call(
+                self.build_call_with_param_attributes(
                     self.intrinsics.data_drop,
                     &[vmctx.as_basic_value_enum().into(), segment.into()],
                     "",
-                ));
+                )?;
             }
             Operator::MemoryCopy { dst_mem, src_mem } => {
                 // ignored until we support multiple memories
@@ -12599,7 +10584,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
 
                 let (dest_pos, src_pos, len) = self.state.pop3()?;
                 let src_index = self.intrinsics.i32_ty.const_int(src.into(), false);
-                err!(self.builder.build_call(
+                self.build_call_with_param_attributes(
                     memory_copy,
                     &[
                         vmctx.as_basic_value_enum().into(),
@@ -12609,7 +10594,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                         len.into(),
                     ],
                     "",
-                ));
+                )?;
             }
             Operator::MemoryFill { mem } => {
                 let (memory_fill, mem) = if let Some(local_memory_index) = self
@@ -12623,7 +10608,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
 
                 let (dst, val, len) = self.state.pop3()?;
                 let mem_index = self.intrinsics.i32_ty.const_int(mem.into(), false);
-                err!(self.builder.build_call(
+                self.build_call_with_param_attributes(
                     memory_fill,
                     &[
                         vmctx.as_basic_value_enum().into(),
@@ -12633,215 +10618,489 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                         len.into(),
                     ],
                     "",
-                ));
+                )?;
             }
-            /***************************
-             * Reference types.
-             * https://github.com/WebAssembly/reference-types/blob/master/proposals/reference-types/Overview.md
-             ***************************/
-            Operator::RefNull { hty } => {
-                let ty = err!(wpheaptype_to_type(hty));
-                let ty = type_to_llvm(self.intrinsics, ty)?;
-                self.state.push1(ty.const_zero());
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    // Atomic memory operations.
+    fn translate_atomic_memory_operator(&mut self, op: Operator) -> Result<(), CompileError> {
+        let vmctx = &self.ctx.basic().into_pointer_value();
+
+        match op {
+            Operator::AtomicFence => {
+                // Fence is a nop.
+                //
+                // Fence was added to preserve information about fences from
+                // source languages. If in the future Wasm extends the memory
+                // model, and if we hadn't recorded what fences used to be there,
+                // it would lead to data races that weren't present in the
+                // original source language.
             }
-            Operator::RefIsNull => {
-                let value = self.state.pop1()?.into_pointer_value();
-                let is_null = err!(self.builder.build_is_null(value, ""));
-                let is_null = err!(self.builder.build_int_z_extend(
-                    is_null,
+            Operator::I32AtomicLoad { ref memarg } => {
+                let offset = self.state.pop1()?.into_int_value();
+                let result = self.build_annotated_atomic_load(
                     self.intrinsics.i32_ty,
-                    ""
-                ));
-                self.state.push1(is_null);
+                    self.intrinsics.i32_ty,
+                    offset,
+                    memarg,
+                )?;
+                self.state.push1(result);
             }
-            Operator::RefFunc { function_index } => {
-                let index = self
-                    .intrinsics
-                    .i32_ty
-                    .const_int(function_index.into(), false);
-                let value = err!(self.builder.build_call(
-                    self.intrinsics.func_ref,
-                    &[self.ctx.basic().into(), index.into()],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
-                self.state.push1(value);
+            Operator::I64AtomicLoad { ref memarg } => {
+                let offset = self.state.pop1()?.into_int_value();
+                let result = self.build_annotated_atomic_load(
+                    self.intrinsics.i64_ty,
+                    self.intrinsics.i64_ty,
+                    offset,
+                    memarg,
+                )?;
+                self.state.push1(result);
             }
-            Operator::TableGet { table } => {
-                let table_index = self.intrinsics.i32_ty.const_int(table.into(), false);
-                let elem = self.state.pop1()?;
-                let table_get = if self
-                    .wasm_module
-                    .local_table_index(TableIndex::from_u32(table))
-                    .is_some()
-                {
-                    self.intrinsics.table_get
-                } else {
-                    self.intrinsics.imported_table_get
-                };
-                let value = err!(self.builder.build_call(
-                    table_get,
-                    &[self.ctx.basic().into(), table_index.into(), elem.into()],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
-                let value = err!(
-                    self.builder.build_bit_cast(
-                        value,
-                        type_to_llvm(
-                            self.intrinsics,
-                            self.wasm_module
-                                .tables
-                                .get(TableIndex::from_u32(table))
-                                .unwrap()
-                                .ty,
-                        )?,
-                        "",
-                    )
-                );
-                self.state.push1(value);
+            Operator::I32AtomicLoad8U { ref memarg } => {
+                let offset = self.state.pop1()?.into_int_value();
+                let result = self.build_annotated_atomic_load(
+                    self.intrinsics.i32_ty,
+                    self.intrinsics.i8_ty,
+                    offset,
+                    memarg,
+                )?;
+                self.state.push1_extra(result, ExtraInfo::arithmetic_f32());
             }
-            Operator::TableSet { table } => {
-                let table_index = self.intrinsics.i32_ty.const_int(table.into(), false);
-                let (elem, value) = self.state.pop2()?;
-                let value = err!(
-                    self.builder
-                        .build_bit_cast(value, self.intrinsics.ptr_ty, "")
-                );
-                let table_set = if self
-                    .wasm_module
-                    .local_table_index(TableIndex::from_u32(table))
-                    .is_some()
-                {
-                    self.intrinsics.table_set
-                } else {
-                    self.intrinsics.imported_table_set
-                };
-                err!(self.builder.build_call(
-                    table_set,
-                    &[
-                        self.ctx.basic().into(),
-                        table_index.into(),
-                        elem.into(),
-                        value.into(),
-                    ],
-                    "",
-                ));
+            Operator::I32AtomicLoad16U { ref memarg } => {
+                let offset = self.state.pop1()?.into_int_value();
+                let result = self.build_annotated_atomic_load(
+                    self.intrinsics.i32_ty,
+                    self.intrinsics.i16_ty,
+                    offset,
+                    memarg,
+                )?;
+                self.state.push1_extra(result, ExtraInfo::arithmetic_f32());
             }
-            Operator::TableCopy {
-                dst_table,
-                src_table,
-            } => {
-                let (dst, src, len) = self.state.pop3()?;
-                let dst_table = self.intrinsics.i32_ty.const_int(dst_table as u64, false);
-                let src_table = self.intrinsics.i32_ty.const_int(src_table as u64, false);
-                err!(self.builder.build_call(
-                    self.intrinsics.table_copy,
-                    &[
-                        self.ctx.basic().into(),
-                        dst_table.into(),
-                        src_table.into(),
-                        dst.into(),
-                        src.into(),
-                        len.into(),
-                    ],
-                    "",
-                ));
+            Operator::I64AtomicLoad8U { ref memarg } => {
+                let offset = self.state.pop1()?.into_int_value();
+                let result = self.build_annotated_atomic_load(
+                    self.intrinsics.i64_ty,
+                    self.intrinsics.i8_ty,
+                    offset,
+                    memarg,
+                )?;
+                self.state.push1_extra(result, ExtraInfo::arithmetic_f64());
             }
-            Operator::TableInit { elem_index, table } => {
-                let (dst, src, len) = self.state.pop3()?;
-                let segment = self.intrinsics.i32_ty.const_int(elem_index as u64, false);
-                let table = self.intrinsics.i32_ty.const_int(table as u64, false);
-                err!(self.builder.build_call(
-                    self.intrinsics.table_init,
-                    &[
-                        self.ctx.basic().into(),
-                        table.into(),
-                        segment.into(),
-                        dst.into(),
-                        src.into(),
-                        len.into(),
-                    ],
-                    "",
-                ));
+            Operator::I64AtomicLoad16U { ref memarg } => {
+                let offset = self.state.pop1()?.into_int_value();
+                let result = self.build_annotated_atomic_load(
+                    self.intrinsics.i64_ty,
+                    self.intrinsics.i16_ty,
+                    offset,
+                    memarg,
+                )?;
+                self.state.push1_extra(result, ExtraInfo::arithmetic_f64());
             }
-            Operator::ElemDrop { elem_index } => {
-                let segment = self.intrinsics.i32_ty.const_int(elem_index as u64, false);
-                err!(self.builder.build_call(
-                    self.intrinsics.elem_drop,
-                    &[self.ctx.basic().into(), segment.into()],
-                    "",
-                ));
+            Operator::I64AtomicLoad32U { ref memarg } => {
+                let offset = self.state.pop1()?.into_int_value();
+                let result = self.build_annotated_atomic_load(
+                    self.intrinsics.i64_ty,
+                    self.intrinsics.i32_ty,
+                    offset,
+                    memarg,
+                )?;
+                self.state.push1_extra(result, ExtraInfo::arithmetic_f64());
             }
-            Operator::TableFill { table } => {
-                let table = self.intrinsics.i32_ty.const_int(table as u64, false);
-                let (start, elem, len) = self.state.pop3()?;
-                let elem = err!(
-                    self.builder
-                        .build_bit_cast(elem, self.intrinsics.ptr_ty, "")
-                );
-                err!(self.builder.build_call(
-                    self.intrinsics.table_fill,
-                    &[
-                        self.ctx.basic().into(),
-                        table.into(),
-                        start.into(),
-                        elem.into(),
-                        len.into(),
-                    ],
-                    "",
-                ));
+            Operator::I32AtomicStore { ref memarg } => {
+                let value = self.state.pop1()?.into_int_value();
+                let offset = self.state.pop1()?.into_int_value();
+                self.build_annotated_atomic_store(
+                    self.intrinsics.i32_ty,
+                    self.intrinsics.i32_ty,
+                    offset,
+                    value,
+                    memarg,
+                )?;
             }
-            Operator::TableGrow { table } => {
-                let (elem, delta) = self.state.pop2()?;
-                let elem = err!(
-                    self.builder
-                        .build_bit_cast(elem, self.intrinsics.ptr_ty, "")
-                );
-                let (table_grow, table_index) = if let Some(local_table_index) = self
-                    .wasm_module
-                    .local_table_index(TableIndex::from_u32(table))
-                {
-                    (self.intrinsics.table_grow, local_table_index.as_u32())
-                } else {
-                    (self.intrinsics.imported_table_grow, table)
-                };
-                let table_index = self.intrinsics.i32_ty.const_int(table_index as u64, false);
-                let size = err!(self.builder.build_call(
-                    table_grow,
-                    &[
-                        self.ctx.basic().into(),
-                        elem.into(),
-                        delta.into(),
-                        table_index.into(),
-                    ],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
-                self.state.push1(size);
+            Operator::I64AtomicStore { ref memarg } => {
+                let value = self.state.pop1()?.into_int_value();
+                let offset = self.state.pop1()?.into_int_value();
+                self.build_annotated_atomic_store(
+                    self.intrinsics.i64_ty,
+                    self.intrinsics.i64_ty,
+                    offset,
+                    value,
+                    memarg,
+                )?;
             }
-            Operator::TableSize { table } => {
-                let (table_size, table_index) = if let Some(local_table_index) = self
-                    .wasm_module
-                    .local_table_index(TableIndex::from_u32(table))
-                {
-                    (self.intrinsics.table_size, local_table_index.as_u32())
-                } else {
-                    (self.intrinsics.imported_table_size, table)
-                };
-                let table_index = self.intrinsics.i32_ty.const_int(table_index as u64, false);
-                let size = err!(self.builder.build_call(
-                    table_size,
-                    &[self.ctx.basic().into(), table_index.into()],
-                    "",
-                ))
-                .try_as_basic_value()
-                .unwrap_basic();
-                self.state.push1(size);
+            Operator::I32AtomicStore8 { ref memarg } | Operator::I64AtomicStore8 { ref memarg } => {
+                let value = self.state.pop1()?.into_int_value();
+                let offset = self.state.pop1()?.into_int_value();
+                self.build_annotated_atomic_store(
+                    value.get_type(),
+                    self.intrinsics.i8_ty,
+                    offset,
+                    value,
+                    memarg,
+                )?;
             }
+            Operator::I32AtomicStore16 { ref memarg }
+            | Operator::I64AtomicStore16 { ref memarg } => {
+                let value = self.state.pop1()?.into_int_value();
+                let offset = self.state.pop1()?.into_int_value();
+                self.build_annotated_atomic_store(
+                    value.get_type(),
+                    self.intrinsics.i16_ty,
+                    offset,
+                    value,
+                    memarg,
+                )?;
+            }
+            Operator::I64AtomicStore32 { ref memarg } => {
+                let value = self.state.pop1()?.into_int_value();
+                let offset = self.state.pop1()?.into_int_value();
+                self.build_annotated_atomic_store(
+                    self.intrinsics.i64_ty,
+                    self.intrinsics.i32_ty,
+                    offset,
+                    value,
+                    memarg,
+                )?;
+            }
+            Operator::I32AtomicRmw8AddU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i8_ty,
+                memarg,
+                AtomicRMWBinOp::Add,
+                Some(ExtraInfo::arithmetic_f32()),
+            )?,
+            Operator::I32AtomicRmw16AddU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i16_ty,
+                memarg,
+                AtomicRMWBinOp::Add,
+                Some(ExtraInfo::arithmetic_f32()),
+            )?,
+            Operator::I32AtomicRmwAdd { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i32_ty,
+                memarg,
+                AtomicRMWBinOp::Add,
+                None,
+            )?,
+            Operator::I64AtomicRmw8AddU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i8_ty,
+                memarg,
+                AtomicRMWBinOp::Add,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmw16AddU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i16_ty,
+                memarg,
+                AtomicRMWBinOp::Add,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmw32AddU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i32_ty,
+                memarg,
+                AtomicRMWBinOp::Add,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmwAdd { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i64_ty,
+                memarg,
+                AtomicRMWBinOp::Add,
+                None,
+            )?,
+            Operator::I32AtomicRmw8SubU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i8_ty,
+                memarg,
+                AtomicRMWBinOp::Sub,
+                Some(ExtraInfo::arithmetic_f32()),
+            )?,
+            Operator::I32AtomicRmw16SubU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i16_ty,
+                memarg,
+                AtomicRMWBinOp::Sub,
+                Some(ExtraInfo::arithmetic_f32()),
+            )?,
+            Operator::I32AtomicRmwSub { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i32_ty,
+                memarg,
+                AtomicRMWBinOp::Sub,
+                None,
+            )?,
+            Operator::I64AtomicRmw8SubU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i8_ty,
+                memarg,
+                AtomicRMWBinOp::Sub,
+                Some(ExtraInfo::arithmetic_f32()),
+            )?,
+            Operator::I64AtomicRmw16SubU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i16_ty,
+                memarg,
+                AtomicRMWBinOp::Sub,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmw32SubU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i32_ty,
+                memarg,
+                AtomicRMWBinOp::Sub,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmwSub { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i64_ty,
+                memarg,
+                AtomicRMWBinOp::Sub,
+                None,
+            )?,
+            Operator::I32AtomicRmw8AndU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i8_ty,
+                memarg,
+                AtomicRMWBinOp::And,
+                Some(ExtraInfo::arithmetic_f32()),
+            )?,
+            Operator::I32AtomicRmw16AndU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i16_ty,
+                memarg,
+                AtomicRMWBinOp::And,
+                Some(ExtraInfo::arithmetic_f32()),
+            )?,
+            Operator::I32AtomicRmwAnd { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i32_ty,
+                memarg,
+                AtomicRMWBinOp::And,
+                None,
+            )?,
+            Operator::I64AtomicRmw8AndU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i8_ty,
+                memarg,
+                AtomicRMWBinOp::And,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmw16AndU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i16_ty,
+                memarg,
+                AtomicRMWBinOp::And,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmw32AndU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i32_ty,
+                memarg,
+                AtomicRMWBinOp::And,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmwAnd { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i64_ty,
+                memarg,
+                AtomicRMWBinOp::And,
+                None,
+            )?,
+            Operator::I32AtomicRmw8OrU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i8_ty,
+                memarg,
+                AtomicRMWBinOp::Or,
+                Some(ExtraInfo::arithmetic_f32()),
+            )?,
+            Operator::I32AtomicRmw16OrU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i16_ty,
+                memarg,
+                AtomicRMWBinOp::Or,
+                Some(ExtraInfo::arithmetic_f32()),
+            )?,
+            Operator::I32AtomicRmwOr { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i32_ty,
+                memarg,
+                AtomicRMWBinOp::Or,
+                Some(ExtraInfo::arithmetic_f32()),
+            )?,
+            Operator::I64AtomicRmw8OrU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i8_ty,
+                memarg,
+                AtomicRMWBinOp::Or,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmw16OrU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i16_ty,
+                memarg,
+                AtomicRMWBinOp::Or,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmw32OrU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i32_ty,
+                memarg,
+                AtomicRMWBinOp::Or,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmwOr { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i64_ty,
+                memarg,
+                AtomicRMWBinOp::Or,
+                None,
+            )?,
+            Operator::I32AtomicRmw8XorU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i8_ty,
+                memarg,
+                AtomicRMWBinOp::Xor,
+                Some(ExtraInfo::arithmetic_f32()),
+            )?,
+            Operator::I32AtomicRmw16XorU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i16_ty,
+                memarg,
+                AtomicRMWBinOp::Xor,
+                Some(ExtraInfo::arithmetic_f32()),
+            )?,
+            Operator::I32AtomicRmwXor { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i32_ty,
+                memarg,
+                AtomicRMWBinOp::Xor,
+                None,
+            )?,
+            Operator::I64AtomicRmw8XorU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i8_ty,
+                memarg,
+                AtomicRMWBinOp::Xor,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmw16XorU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i16_ty,
+                memarg,
+                AtomicRMWBinOp::Xor,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmw32XorU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i32_ty,
+                memarg,
+                AtomicRMWBinOp::Xor,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmwXor { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i64_ty,
+                memarg,
+                AtomicRMWBinOp::Xor,
+                None,
+            )?,
+            Operator::I32AtomicRmw8XchgU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i8_ty,
+                memarg,
+                AtomicRMWBinOp::Xchg,
+                Some(ExtraInfo::arithmetic_f32()),
+            )?,
+            Operator::I32AtomicRmw16XchgU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i16_ty,
+                memarg,
+                AtomicRMWBinOp::Xchg,
+                Some(ExtraInfo::arithmetic_f32()),
+            )?,
+            Operator::I32AtomicRmwXchg { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i32_ty,
+                memarg,
+                AtomicRMWBinOp::Xchg,
+                None,
+            )?,
+            Operator::I64AtomicRmw8XchgU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i8_ty,
+                memarg,
+                AtomicRMWBinOp::Xchg,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmw16XchgU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i16_ty,
+                memarg,
+                AtomicRMWBinOp::Xchg,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmw32XchgU { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i32_ty,
+                memarg,
+                AtomicRMWBinOp::Xchg,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmwXchg { ref memarg } => self.translate_atomic_rmw(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i64_ty,
+                memarg,
+                AtomicRMWBinOp::Xchg,
+                None,
+            )?,
+            Operator::I32AtomicRmw8CmpxchgU { ref memarg } => self.translate_atomic_rmw_cmpxchg(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i8_ty,
+                memarg,
+                Some(ExtraInfo::arithmetic_f32()),
+            )?,
+            Operator::I32AtomicRmw16CmpxchgU { ref memarg } => self.translate_atomic_rmw_cmpxchg(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i16_ty,
+                memarg,
+                Some(ExtraInfo::arithmetic_f32()),
+            )?,
+            Operator::I32AtomicRmwCmpxchg { ref memarg } => self.translate_atomic_rmw_cmpxchg(
+                self.intrinsics.i32_ty,
+                self.intrinsics.i32_ty,
+                memarg,
+                None,
+            )?,
+            Operator::I64AtomicRmw8CmpxchgU { ref memarg } => self.translate_atomic_rmw_cmpxchg(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i8_ty,
+                memarg,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmw16CmpxchgU { ref memarg } => self.translate_atomic_rmw_cmpxchg(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i16_ty,
+                memarg,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmw32CmpxchgU { ref memarg } => self.translate_atomic_rmw_cmpxchg(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i32_ty,
+                memarg,
+                Some(ExtraInfo::arithmetic_f64()),
+            )?,
+            Operator::I64AtomicRmwCmpxchg { ref memarg } => self.translate_atomic_rmw_cmpxchg(
+                self.intrinsics.i64_ty,
+                self.intrinsics.i64_ty,
+                memarg,
+                None,
+            )?,
             Operator::MemoryAtomicWait32 { memarg } => {
                 let memory_index = MemoryIndex::from_u32(memarg.memory);
                 let (dst, val, timeout) = self.state.pop3()?;
@@ -12910,7 +11169,250 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 );
                 self.state.push1(cnt.try_as_basic_value().unwrap_basic());
             }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
 
+    // Reference types.
+    // https://github.com/WebAssembly/reference-types/blob/master/proposals/reference-types/Overview.md
+    fn translate_reference_operator(&mut self, op: Operator) -> Result<(), CompileError> {
+        match op {
+            Operator::RefNull { hty } => {
+                let ty = err!(wpheaptype_to_type(hty));
+                let ty = type_to_llvm(self.intrinsics, ty)?;
+                self.state.push1(ty.const_zero());
+            }
+            Operator::RefIsNull => {
+                let value = self.state.pop1()?;
+                let is_null = match value {
+                    BasicValueEnum::IntValue(value) => err!(self.builder.build_int_compare(
+                        IntPredicate::EQ,
+                        value,
+                        value.get_type().const_zero(),
+                        "",
+                    )),
+                    BasicValueEnum::PointerValue(value) => {
+                        err!(self.builder.build_is_null(value, ""))
+                    }
+                    _ => unreachable!("ref.is_null only accepts reference types"),
+                };
+                let is_null = err!(self.builder.build_int_z_extend(
+                    is_null,
+                    self.intrinsics.i32_ty,
+                    ""
+                ));
+                self.state.push1(is_null);
+            }
+            Operator::RefFunc { function_index } => {
+                let index = self
+                    .intrinsics
+                    .i32_ty
+                    .const_int(function_index.into(), false);
+                let value = self
+                    .build_call_with_param_attributes(
+                        self.intrinsics.func_ref,
+                        &[self.ctx.basic().into(), index.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                self.state.push1(value);
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    // Table operators.
+    fn translate_table_operator(&mut self, op: Operator) -> Result<(), CompileError> {
+        match op {
+            Operator::TableGet { table } => {
+                let table_index = self.intrinsics.i32_ty.const_int(table.into(), false);
+                let elem = self.state.pop1()?;
+                let table_get = if self
+                    .wasm_module
+                    .local_table_index(TableIndex::from_u32(table))
+                    .is_some()
+                {
+                    self.intrinsics.table_get
+                } else {
+                    self.intrinsics.imported_table_get
+                };
+                let value = self
+                    .build_call_with_param_attributes(
+                        table_get,
+                        &[self.ctx.basic().into(), table_index.into(), elem.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let value = err!(
+                    self.builder.build_bit_cast(
+                        value,
+                        type_to_llvm(
+                            self.intrinsics,
+                            self.wasm_module
+                                .tables
+                                .get(TableIndex::from_u32(table))
+                                .unwrap()
+                                .ty,
+                        )?,
+                        "",
+                    )
+                );
+                self.state.push1(value);
+            }
+            Operator::TableSet { table } => {
+                let table_index = self.intrinsics.i32_ty.const_int(table.into(), false);
+                let (elem, value) = self.state.pop2()?;
+                let value = err!(
+                    self.builder
+                        .build_bit_cast(value, self.intrinsics.ptr_ty, "")
+                );
+                let table_set = if self
+                    .wasm_module
+                    .local_table_index(TableIndex::from_u32(table))
+                    .is_some()
+                {
+                    self.intrinsics.table_set
+                } else {
+                    self.intrinsics.imported_table_set
+                };
+                self.build_call_with_param_attributes(
+                    table_set,
+                    &[
+                        self.ctx.basic().into(),
+                        table_index.into(),
+                        elem.into(),
+                        value.into(),
+                    ],
+                    "",
+                )?;
+            }
+            Operator::TableCopy {
+                dst_table,
+                src_table,
+            } => {
+                let (dst, src, len) = self.state.pop3()?;
+                let dst_table = self.intrinsics.i32_ty.const_int(dst_table as u64, false);
+                let src_table = self.intrinsics.i32_ty.const_int(src_table as u64, false);
+                self.build_call_with_param_attributes(
+                    self.intrinsics.table_copy,
+                    &[
+                        self.ctx.basic().into(),
+                        dst_table.into(),
+                        src_table.into(),
+                        dst.into(),
+                        src.into(),
+                        len.into(),
+                    ],
+                    "",
+                )?;
+            }
+            Operator::TableInit { elem_index, table } => {
+                let (dst, src, len) = self.state.pop3()?;
+                let segment = self.intrinsics.i32_ty.const_int(elem_index as u64, false);
+                let table = self.intrinsics.i32_ty.const_int(table as u64, false);
+                self.build_call_with_param_attributes(
+                    self.intrinsics.table_init,
+                    &[
+                        self.ctx.basic().into(),
+                        table.into(),
+                        segment.into(),
+                        dst.into(),
+                        src.into(),
+                        len.into(),
+                    ],
+                    "",
+                )?;
+            }
+            Operator::ElemDrop { elem_index } => {
+                let segment = self.intrinsics.i32_ty.const_int(elem_index as u64, false);
+                self.build_call_with_param_attributes(
+                    self.intrinsics.elem_drop,
+                    &[self.ctx.basic().into(), segment.into()],
+                    "",
+                )?;
+            }
+            Operator::TableFill { table } => {
+                let table = self.intrinsics.i32_ty.const_int(table as u64, false);
+                let (start, elem, len) = self.state.pop3()?;
+                let elem = err!(
+                    self.builder
+                        .build_bit_cast(elem, self.intrinsics.ptr_ty, "")
+                );
+                self.build_call_with_param_attributes(
+                    self.intrinsics.table_fill,
+                    &[
+                        self.ctx.basic().into(),
+                        table.into(),
+                        start.into(),
+                        elem.into(),
+                        len.into(),
+                    ],
+                    "",
+                )?;
+            }
+            Operator::TableGrow { table } => {
+                let (elem, delta) = self.state.pop2()?;
+                let elem = err!(
+                    self.builder
+                        .build_bit_cast(elem, self.intrinsics.ptr_ty, "")
+                );
+                let (table_grow, table_index) = if let Some(local_table_index) = self
+                    .wasm_module
+                    .local_table_index(TableIndex::from_u32(table))
+                {
+                    (self.intrinsics.table_grow, local_table_index.as_u32())
+                } else {
+                    (self.intrinsics.imported_table_grow, table)
+                };
+                let table_index = self.intrinsics.i32_ty.const_int(table_index as u64, false);
+                let size = self
+                    .build_call_with_param_attributes(
+                        table_grow,
+                        &[
+                            self.ctx.basic().into(),
+                            elem.into(),
+                            delta.into(),
+                            table_index.into(),
+                        ],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                self.state.push1(size);
+            }
+            Operator::TableSize { table } => {
+                let (table_size, table_index) = if let Some(local_table_index) = self
+                    .wasm_module
+                    .local_table_index(TableIndex::from_u32(table))
+                {
+                    (self.intrinsics.table_size, local_table_index.as_u32())
+                } else {
+                    (self.intrinsics.imported_table_size, table)
+                };
+                let table_index = self.intrinsics.i32_ty.const_int(table_index as u64, false);
+                let size = self
+                    .build_call_with_param_attributes(
+                        table_size,
+                        &[self.ctx.basic().into(), table_index.into()],
+                        "",
+                    )?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                self.state.push1(size);
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    // Exception handling.
+    // https://github.com/WebAssembly/exception-handling/blob/main/proposals/exception-handling/Exceptions.md
+    fn translate_eh_operator(&mut self, op: Operator) -> Result<(), CompileError> {
+        match op {
             Operator::TryTable { try_table } => {
                 let current_block = self
                     .builder
@@ -13042,11 +11544,11 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                     err!(self.builder.build_unconditional_branch(catch_end_block));
 
                     self.builder.position_at_end(catch_specific_block);
-                    let selector_value = err!(self.builder.build_call(
+                    let selector_value = self.build_call_with_param_attributes(
                         self.intrinsics.personality2,
                         &[self.ctx.basic().into(), uw_exc.into()],
-                        "selector"
-                    ));
+                        "selector",
+                    )?;
                     err!(self.builder.build_unconditional_branch(catch_end_block));
 
                     self.builder.position_at_end(catch_end_block);
@@ -13076,7 +11578,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                     // just re-allocate a new exception.
                     //
                     // Note that this is different from how it's done in C++ land, where the
-                    // exception object is kept around for rethrowing; this discrepency exists
+                    // exception object is kept around for rethrowing; this discrepancy exists
                     // because in C++, exception handling is lexical (i.e. there's an implicit
                     // "current exception" in catch blocks) whereas in WASM, you rethrow with
                     // an exnref that may very well have come from somewhere else; consider this
@@ -13113,11 +11615,11 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                     // All of this is to say that putting exception deallocation and exnref
                     // retrieval in the same function has been a very deliberate choice.
                     let uw_exc = uw_exc.into_pointer_value();
-                    let exnref = err!(self.builder.build_call(
+                    let exnref = self.build_call_with_param_attributes(
                         self.intrinsics.exception_into_exnref,
                         &[uw_exc.into()],
-                        "exnref"
-                    ));
+                        "exnref",
+                    )?;
 
                     let exnref = exnref.try_as_basic_value().unwrap_basic().into_int_value();
                     let selector = selector.as_basic_value().into_int_value();
@@ -13323,11 +11825,11 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                     // -- The rethrow block
                     self.builder.position_at_end(rethrow_block);
 
-                    err!(self.builder.build_call(
+                    self.build_call_with_param_attributes(
                         self.intrinsics.throw,
                         &[self.ctx.basic().into(), exnref.into()],
-                        "rethrow"
-                    ));
+                        "rethrow",
+                    )?;
                     // can't reach after an explicit throw!
                     err!(self.builder.build_unreachable());
 
@@ -13337,7 +11839,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 // Move back to current block
                 self.builder.position_at_end(current_block);
 
-                // Note: catch_tag_values also containes outer tags, but zipping with
+                // Note: catch_tag_values also contains outer tags, but zipping with
                 // catch_blocks will let us ignore the extra ones.
                 let catch_tags_and_blocks = catch_tag_values
                     .into_iter()
@@ -13440,11 +11942,11 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
 
                     self.builder.position_at_end(current_block);
                 } else {
-                    err!(self.builder.build_call(
+                    self.build_call_with_param_attributes(
                         self.intrinsics.throw,
                         &[self.ctx.basic().into(), exnref.into()],
-                        "throw"
-                    ));
+                        "throw",
+                    )?;
                     // can't reach after an explicit throw!
                     err!(self.builder.build_unreachable());
                 }
@@ -13478,16 +11980,588 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
 
                     self.builder.position_at_end(current_block);
                 } else {
-                    err!(self.builder.build_call(
+                    self.build_call_with_param_attributes(
                         self.intrinsics.throw,
                         &[self.ctx.basic().into(), exnref.into()],
-                        "throw"
-                    ));
+                        "throw",
+                    )?;
                     // can't reach after an explicit throw!
                     err!(self.builder.build_unreachable());
                 }
 
                 self.state.reachable = false;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn translate_operator(&mut self, op: Operator, _source_loc: u32) -> Result<(), CompileError> {
+        //let opcode_offset: Option<usize> = None;
+
+        if !self.state.reachable {
+            match op {
+                Operator::Block { blockty: _ }
+                | Operator::Loop { blockty: _ }
+                | Operator::If { blockty: _ }
+                | Operator::TryTable { .. } => {
+                    self.unreachable_depth += 1;
+                    return Ok(());
+                }
+                Operator::Else => {
+                    if self.unreachable_depth != 0 {
+                        return Ok(());
+                    }
+                }
+                Operator::End => {
+                    if self.unreachable_depth != 0 {
+                        self.unreachable_depth -= 1;
+                        return Ok(());
+                    }
+                }
+                _ => {
+                    return Ok(());
+                }
+            }
+        }
+
+        match op {
+            Operator::Block { .. }
+            | Operator::Loop { .. }
+            | Operator::Br { .. }
+            | Operator::BrIf { .. }
+            | Operator::BrTable { .. }
+            | Operator::If { .. }
+            | Operator::Else
+            | Operator::End
+            | Operator::Return
+            | Operator::Unreachable => {
+                self.translate_control_flow_operator(op)?;
+            }
+            Operator::Nop
+            | Operator::Drop
+            | Operator::I32Const { .. }
+            | Operator::I64Const { .. }
+            | Operator::F32Const { .. }
+            | Operator::F64Const { .. }
+            | Operator::V128Const { .. }
+            | Operator::I8x16Splat
+            | Operator::I16x8Splat
+            | Operator::I32x4Splat
+            | Operator::I64x2Splat
+            | Operator::F32x4Splat
+            | Operator::F64x2Splat
+            | Operator::LocalGet { .. }
+            | Operator::LocalSet { .. }
+            | Operator::LocalTee { .. }
+            | Operator::GlobalGet { .. }
+            | Operator::GlobalSet { .. }
+            | Operator::Call { .. }
+            | Operator::ReturnCall { .. }
+            | Operator::CallIndirect { .. }
+            | Operator::ReturnCallIndirect { .. }
+            | Operator::TypedSelect { .. }
+            | Operator::Select => {
+                self.translate_basic_operator(op)?;
+            }
+            Operator::I32Add
+            | Operator::I64Add
+            | Operator::I8x16Add
+            | Operator::I16x8Add
+            | Operator::I16x8ExtAddPairwiseI8x16S
+            | Operator::I16x8ExtAddPairwiseI8x16U
+            | Operator::I32x4Add
+            | Operator::I32x4ExtAddPairwiseI16x8S
+            | Operator::I32x4ExtAddPairwiseI16x8U
+            | Operator::I64x2Add
+            | Operator::I8x16AddSatS
+            | Operator::I16x8AddSatS
+            | Operator::I8x16AddSatU
+            | Operator::I16x8AddSatU
+            | Operator::I32Sub
+            | Operator::I64Sub
+            | Operator::I8x16Sub
+            | Operator::I16x8Sub
+            | Operator::I32x4Sub
+            | Operator::I64x2Sub
+            | Operator::I8x16SubSatS
+            | Operator::I16x8SubSatS
+            | Operator::I8x16SubSatU
+            | Operator::I16x8SubSatU
+            | Operator::I32Mul
+            | Operator::I64Mul
+            | Operator::I16x8Mul
+            | Operator::I32x4Mul
+            | Operator::I64x2Mul
+            | Operator::I16x8RelaxedQ15mulrS
+            | Operator::I16x8Q15MulrSatS
+            | Operator::I16x8ExtMulLowI8x16S
+            | Operator::I16x8ExtMulLowI8x16U
+            | Operator::I16x8ExtMulHighI8x16S
+            | Operator::I16x8ExtMulHighI8x16U
+            | Operator::I32x4ExtMulLowI16x8S
+            | Operator::I32x4ExtMulLowI16x8U
+            | Operator::I32x4ExtMulHighI16x8S
+            | Operator::I32x4ExtMulHighI16x8U
+            | Operator::I64x2ExtMulLowI32x4S
+            | Operator::I64x2ExtMulLowI32x4U
+            | Operator::I64x2ExtMulHighI32x4S
+            | Operator::I64x2ExtMulHighI32x4U
+            | Operator::I32x4DotI16x8S
+            | Operator::I16x8RelaxedDotI8x16I7x16S
+            | Operator::I32x4RelaxedDotI8x16I7x16AddS
+            | Operator::I32DivS
+            | Operator::I64DivS
+            | Operator::I32DivU
+            | Operator::I64DivU
+            | Operator::I32RemS
+            | Operator::I64RemS
+            | Operator::I32RemU
+            | Operator::I64RemU
+            | Operator::I32And
+            | Operator::I64And
+            | Operator::V128And
+            | Operator::I32Or
+            | Operator::I64Or
+            | Operator::V128Or
+            | Operator::I32Xor
+            | Operator::I64Xor
+            | Operator::V128Xor
+            | Operator::V128AndNot
+            | Operator::I8x16RelaxedLaneselect
+            | Operator::I16x8RelaxedLaneselect
+            | Operator::I32x4RelaxedLaneselect
+            | Operator::I64x2RelaxedLaneselect
+            | Operator::V128Bitselect
+            | Operator::I8x16Bitmask
+            | Operator::I16x8Bitmask
+            | Operator::I32x4Bitmask
+            | Operator::I64x2Bitmask
+            | Operator::I32Shl
+            | Operator::I64Shl
+            | Operator::I8x16Shl
+            | Operator::I16x8Shl
+            | Operator::I32x4Shl
+            | Operator::I64x2Shl
+            | Operator::I32ShrS
+            | Operator::I64ShrS
+            | Operator::I8x16ShrS
+            | Operator::I16x8ShrS
+            | Operator::I32x4ShrS
+            | Operator::I64x2ShrS
+            | Operator::I32ShrU
+            | Operator::I64ShrU
+            | Operator::I8x16ShrU
+            | Operator::I16x8ShrU
+            | Operator::I32x4ShrU
+            | Operator::I64x2ShrU
+            | Operator::I32Rotl
+            | Operator::I64Rotl
+            | Operator::I32Rotr
+            | Operator::I64Rotr
+            | Operator::I32Clz
+            | Operator::I64Clz
+            | Operator::I32Ctz
+            | Operator::I64Ctz
+            | Operator::I8x16Popcnt
+            | Operator::I32Popcnt
+            | Operator::I64Popcnt
+            | Operator::I32Eqz
+            | Operator::I64Eqz
+            | Operator::I8x16Abs
+            | Operator::I16x8Abs
+            | Operator::I32x4Abs
+            | Operator::I64x2Abs
+            | Operator::I8x16MinS
+            | Operator::I8x16MinU
+            | Operator::I8x16MaxS
+            | Operator::I8x16MaxU
+            | Operator::I16x8MinS
+            | Operator::I16x8MinU
+            | Operator::I16x8MaxS
+            | Operator::I16x8MaxU
+            | Operator::I32x4MinS
+            | Operator::I32x4MinU
+            | Operator::I32x4MaxS
+            | Operator::I32x4MaxU
+            | Operator::I8x16AvgrU
+            | Operator::I16x8AvgrU
+            | Operator::I64Add128
+            | Operator::I64Sub128
+            | Operator::I64MulWideS
+            | Operator::I64MulWideU => self.translate_integer_arithmetic_operator(op)?,
+            Operator::F32Add
+            | Operator::F64Add
+            | Operator::F32x4Add
+            | Operator::F64x2Add
+            | Operator::F32Sub
+            | Operator::F64Sub
+            | Operator::F32x4Sub
+            | Operator::F64x2Sub
+            | Operator::F32Mul
+            | Operator::F64Mul
+            | Operator::F32x4Mul
+            | Operator::F32x4RelaxedMadd
+            | Operator::F32x4RelaxedNmadd
+            | Operator::F64x2Mul
+            | Operator::F64x2RelaxedMadd
+            | Operator::F64x2RelaxedNmadd
+            | Operator::F32Div
+            | Operator::F64Div
+            | Operator::F32x4Div
+            | Operator::F64x2Div
+            | Operator::F32Sqrt
+            | Operator::F64Sqrt
+            | Operator::F32x4Sqrt
+            | Operator::F64x2Sqrt
+            | Operator::F32Min
+            | Operator::F64Min
+            | Operator::F32x4RelaxedMin
+            | Operator::F32x4Min
+            | Operator::F32x4PMin
+            | Operator::F64x2RelaxedMin
+            | Operator::F64x2Min
+            | Operator::F64x2PMin
+            | Operator::F32Max
+            | Operator::F64Max
+            | Operator::F32x4RelaxedMax
+            | Operator::F32x4Max
+            | Operator::F32x4PMax
+            | Operator::F64x2RelaxedMax
+            | Operator::F64x2Max
+            | Operator::F64x2PMax
+            | Operator::F32Ceil
+            | Operator::F32x4Ceil
+            | Operator::F64Ceil
+            | Operator::F64x2Ceil
+            | Operator::F32Floor
+            | Operator::F32x4Floor
+            | Operator::F64Floor
+            | Operator::F64x2Floor
+            | Operator::F32Trunc
+            | Operator::F32x4Trunc
+            | Operator::F64Trunc
+            | Operator::F64x2Trunc
+            | Operator::F32Nearest
+            | Operator::F32x4Nearest
+            | Operator::F64Nearest
+            | Operator::F64x2Nearest
+            | Operator::F32Abs
+            | Operator::F64Abs
+            | Operator::F32x4Abs
+            | Operator::F64x2Abs
+            | Operator::F32x4Neg
+            | Operator::F64x2Neg
+            | Operator::F32Neg
+            | Operator::F64Neg
+            | Operator::F32Copysign
+            | Operator::F64Copysign => self.translate_floating_point_arithmetic_operator(op)?,
+            Operator::I32Eq
+            | Operator::I64Eq
+            | Operator::I8x16Eq
+            | Operator::I16x8Eq
+            | Operator::I32x4Eq
+            | Operator::I64x2Eq
+            | Operator::I32Ne
+            | Operator::I64Ne
+            | Operator::I8x16Ne
+            | Operator::I16x8Ne
+            | Operator::I32x4Ne
+            | Operator::I64x2Ne
+            | Operator::I32LtS
+            | Operator::I64LtS
+            | Operator::I8x16LtS
+            | Operator::I16x8LtS
+            | Operator::I32x4LtS
+            | Operator::I64x2LtS
+            | Operator::I32LtU
+            | Operator::I64LtU
+            | Operator::I8x16LtU
+            | Operator::I16x8LtU
+            | Operator::I32x4LtU
+            | Operator::I32LeS
+            | Operator::I64LeS
+            | Operator::I8x16LeS
+            | Operator::I16x8LeS
+            | Operator::I32x4LeS
+            | Operator::I64x2LeS
+            | Operator::I32LeU
+            | Operator::I64LeU
+            | Operator::I8x16LeU
+            | Operator::I16x8LeU
+            | Operator::I32x4LeU
+            | Operator::I32GtS
+            | Operator::I64GtS
+            | Operator::I8x16GtS
+            | Operator::I16x8GtS
+            | Operator::I32x4GtS
+            | Operator::I64x2GtS
+            | Operator::I32GtU
+            | Operator::I64GtU
+            | Operator::I8x16GtU
+            | Operator::I16x8GtU
+            | Operator::I32x4GtU
+            | Operator::I32GeS
+            | Operator::I64GeS
+            | Operator::I8x16GeS
+            | Operator::I16x8GeS
+            | Operator::I32x4GeS
+            | Operator::I64x2GeS
+            | Operator::I32GeU
+            | Operator::I64GeU
+            | Operator::I8x16GeU
+            | Operator::I16x8GeU
+            | Operator::I32x4GeU => self.translate_integer_comparison_operator(op)?,
+            Operator::F32Eq
+            | Operator::F64Eq
+            | Operator::F32x4Eq
+            | Operator::F64x2Eq
+            | Operator::F32Ne
+            | Operator::F64Ne
+            | Operator::F32x4Ne
+            | Operator::F64x2Ne
+            | Operator::F32Lt
+            | Operator::F64Lt
+            | Operator::F32x4Lt
+            | Operator::F64x2Lt
+            | Operator::F32Le
+            | Operator::F64Le
+            | Operator::F32x4Le
+            | Operator::F64x2Le
+            | Operator::F32Gt
+            | Operator::F64Gt
+            | Operator::F32x4Gt
+            | Operator::F64x2Gt
+            | Operator::F32Ge
+            | Operator::F64Ge
+            | Operator::F32x4Ge
+            | Operator::F64x2Ge => self.translate_floating_point_comparison_operator(op)?,
+            Operator::I32WrapI64
+            | Operator::I64ExtendI32S
+            | Operator::I64ExtendI32U
+            | Operator::I16x8ExtendLowI8x16S
+            | Operator::I16x8ExtendHighI8x16S
+            | Operator::I16x8ExtendLowI8x16U
+            | Operator::I16x8ExtendHighI8x16U
+            | Operator::I32x4ExtendLowI16x8S
+            | Operator::I32x4ExtendHighI16x8S
+            | Operator::I32x4ExtendLowI16x8U
+            | Operator::I32x4ExtendHighI16x8U
+            | Operator::I64x2ExtendLowI32x4U
+            | Operator::I64x2ExtendLowI32x4S
+            | Operator::I64x2ExtendHighI32x4U
+            | Operator::I64x2ExtendHighI32x4S
+            | Operator::I8x16NarrowI16x8S
+            | Operator::I8x16NarrowI16x8U
+            | Operator::I16x8NarrowI32x4S
+            | Operator::I16x8NarrowI32x4U
+            | Operator::I32x4RelaxedTruncF32x4S
+            | Operator::I32x4TruncSatF32x4S
+            | Operator::I32x4RelaxedTruncF32x4U
+            | Operator::I32x4TruncSatF32x4U
+            | Operator::I32x4RelaxedTruncF64x2SZero
+            | Operator::I32x4RelaxedTruncF64x2UZero
+            | Operator::I32x4TruncSatF64x2SZero
+            | Operator::I32x4TruncSatF64x2UZero
+            | Operator::I32TruncF32S
+            | Operator::I32TruncF64S
+            | Operator::I32TruncSatF32S
+            | Operator::I32TruncSatF64S
+            | Operator::I64TruncF32S
+            | Operator::I64TruncF64S
+            | Operator::I64TruncSatF32S
+            | Operator::I64TruncSatF64S
+            | Operator::I32TruncF32U
+            | Operator::I32TruncF64U
+            | Operator::I32TruncSatF32U
+            | Operator::I32TruncSatF64U
+            | Operator::I64TruncF32U
+            | Operator::I64TruncF64U
+            | Operator::I64TruncSatF32U
+            | Operator::I64TruncSatF64U
+            | Operator::F32DemoteF64
+            | Operator::F64PromoteF32
+            | Operator::F32ConvertI32S
+            | Operator::F32ConvertI64S
+            | Operator::F64ConvertI32S
+            | Operator::F64ConvertI64S
+            | Operator::F32ConvertI32U
+            | Operator::F32ConvertI64U
+            | Operator::F64ConvertI32U
+            | Operator::F64ConvertI64U
+            | Operator::F32x4ConvertI32x4S
+            | Operator::F32x4ConvertI32x4U
+            | Operator::F64x2ConvertLowI32x4S
+            | Operator::F64x2ConvertLowI32x4U
+            | Operator::F64x2PromoteLowF32x4
+            | Operator::F32x4DemoteF64x2Zero
+            | Operator::I32ReinterpretF32
+            | Operator::I64ReinterpretF64
+            | Operator::F32ReinterpretI32
+            | Operator::F64ReinterpretI64 => self.translate_conversion_operator(op)?,
+            Operator::I32Extend8S
+            | Operator::I32Extend16S
+            | Operator::I64Extend8S
+            | Operator::I64Extend16S
+            | Operator::I64Extend32S => self.translate_sign_extension_operator(op)?,
+            Operator::I32Load { .. }
+            | Operator::I64Load { .. }
+            | Operator::F32Load { .. }
+            | Operator::F64Load { .. }
+            | Operator::V128Load { .. }
+            | Operator::V128Load8Lane { .. }
+            | Operator::V128Load16Lane { .. }
+            | Operator::V128Load32Lane { .. }
+            | Operator::V128Load64Lane { .. }
+            | Operator::I32Store { .. }
+            | Operator::I64Store { .. }
+            | Operator::F32Store { .. }
+            | Operator::F64Store { .. }
+            | Operator::V128Store { .. }
+            | Operator::V128Store8Lane { .. }
+            | Operator::V128Store16Lane { .. }
+            | Operator::V128Store32Lane { .. }
+            | Operator::V128Store64Lane { .. }
+            | Operator::I32Load8S { .. }
+            | Operator::I32Load16S { .. }
+            | Operator::I64Load8S { .. }
+            | Operator::I64Load16S { .. }
+            | Operator::I64Load32S { .. }
+            | Operator::I32Load8U { .. }
+            | Operator::I32Load16U { .. }
+            | Operator::I64Load8U { .. }
+            | Operator::I64Load16U { .. }
+            | Operator::I64Load32U { .. }
+            | Operator::I32Store8 { .. }
+            | Operator::I64Store8 { .. }
+            | Operator::I32Store16 { .. }
+            | Operator::I64Store16 { .. }
+            | Operator::I64Store32 { .. }
+            | Operator::I8x16Neg
+            | Operator::I16x8Neg
+            | Operator::I32x4Neg
+            | Operator::I64x2Neg
+            | Operator::V128Not
+            | Operator::V128AnyTrue
+            | Operator::I8x16AllTrue
+            | Operator::I16x8AllTrue
+            | Operator::I32x4AllTrue
+            | Operator::I64x2AllTrue
+            | Operator::I8x16ExtractLaneS { .. }
+            | Operator::I8x16ExtractLaneU { .. }
+            | Operator::I16x8ExtractLaneS { .. }
+            | Operator::I16x8ExtractLaneU { .. }
+            | Operator::I32x4ExtractLane { .. }
+            | Operator::I64x2ExtractLane { .. }
+            | Operator::F32x4ExtractLane { .. }
+            | Operator::F64x2ExtractLane { .. }
+            | Operator::I8x16ReplaceLane { .. }
+            | Operator::I16x8ReplaceLane { .. }
+            | Operator::I32x4ReplaceLane { .. }
+            | Operator::I64x2ReplaceLane { .. }
+            | Operator::F32x4ReplaceLane { .. }
+            | Operator::F64x2ReplaceLane { .. }
+            | Operator::I8x16RelaxedSwizzle
+            | Operator::I8x16Swizzle
+            | Operator::I8x16Shuffle { .. }
+            | Operator::V128Load8x8S { .. }
+            | Operator::V128Load8x8U { .. }
+            | Operator::V128Load16x4S { .. }
+            | Operator::V128Load16x4U { .. }
+            | Operator::V128Load32x2S { .. }
+            | Operator::V128Load32x2U { .. }
+            | Operator::V128Load32Zero { .. }
+            | Operator::V128Load64Zero { .. }
+            | Operator::V128Load8Splat { .. }
+            | Operator::V128Load16Splat { .. }
+            | Operator::V128Load32Splat { .. }
+            | Operator::V128Load64Splat { .. }
+            | Operator::MemoryGrow { .. }
+            | Operator::MemorySize { .. }
+            | Operator::MemoryInit { .. }
+            | Operator::DataDrop { .. }
+            | Operator::MemoryCopy { .. }
+            | Operator::MemoryFill { .. } => self.translate_memory_operator(op)?,
+            Operator::AtomicFence { .. }
+            | Operator::I32AtomicLoad { .. }
+            | Operator::I64AtomicLoad { .. }
+            | Operator::I32AtomicLoad8U { .. }
+            | Operator::I32AtomicLoad16U { .. }
+            | Operator::I64AtomicLoad8U { .. }
+            | Operator::I64AtomicLoad16U { .. }
+            | Operator::I64AtomicLoad32U { .. }
+            | Operator::I32AtomicStore { .. }
+            | Operator::I64AtomicStore { .. }
+            | Operator::I32AtomicStore8 { .. }
+            | Operator::I64AtomicStore8 { .. }
+            | Operator::I32AtomicStore16 { .. }
+            | Operator::I64AtomicStore16 { .. }
+            | Operator::I64AtomicStore32 { .. }
+            | Operator::I32AtomicRmw8AddU { .. }
+            | Operator::I32AtomicRmw16AddU { .. }
+            | Operator::I32AtomicRmwAdd { .. }
+            | Operator::I64AtomicRmw8AddU { .. }
+            | Operator::I64AtomicRmw16AddU { .. }
+            | Operator::I64AtomicRmw32AddU { .. }
+            | Operator::I64AtomicRmwAdd { .. }
+            | Operator::I32AtomicRmw8SubU { .. }
+            | Operator::I32AtomicRmw16SubU { .. }
+            | Operator::I32AtomicRmwSub { .. }
+            | Operator::I64AtomicRmw8SubU { .. }
+            | Operator::I64AtomicRmw16SubU { .. }
+            | Operator::I64AtomicRmw32SubU { .. }
+            | Operator::I64AtomicRmwSub { .. }
+            | Operator::I32AtomicRmw8AndU { .. }
+            | Operator::I32AtomicRmw16AndU { .. }
+            | Operator::I32AtomicRmwAnd { .. }
+            | Operator::I64AtomicRmw8AndU { .. }
+            | Operator::I64AtomicRmw16AndU { .. }
+            | Operator::I64AtomicRmw32AndU { .. }
+            | Operator::I64AtomicRmwAnd { .. }
+            | Operator::I32AtomicRmw8OrU { .. }
+            | Operator::I32AtomicRmw16OrU { .. }
+            | Operator::I32AtomicRmwOr { .. }
+            | Operator::I64AtomicRmw8OrU { .. }
+            | Operator::I64AtomicRmw16OrU { .. }
+            | Operator::I64AtomicRmw32OrU { .. }
+            | Operator::I64AtomicRmwOr { .. }
+            | Operator::I32AtomicRmw8XorU { .. }
+            | Operator::I32AtomicRmw16XorU { .. }
+            | Operator::I32AtomicRmwXor { .. }
+            | Operator::I64AtomicRmw8XorU { .. }
+            | Operator::I64AtomicRmw16XorU { .. }
+            | Operator::I64AtomicRmw32XorU { .. }
+            | Operator::I64AtomicRmwXor { .. }
+            | Operator::I32AtomicRmw8XchgU { .. }
+            | Operator::I32AtomicRmw16XchgU { .. }
+            | Operator::I32AtomicRmwXchg { .. }
+            | Operator::I64AtomicRmw8XchgU { .. }
+            | Operator::I64AtomicRmw16XchgU { .. }
+            | Operator::I64AtomicRmw32XchgU { .. }
+            | Operator::I64AtomicRmwXchg { .. }
+            | Operator::I32AtomicRmw8CmpxchgU { .. }
+            | Operator::I32AtomicRmw16CmpxchgU { .. }
+            | Operator::I32AtomicRmwCmpxchg { .. }
+            | Operator::I64AtomicRmw8CmpxchgU { .. }
+            | Operator::I64AtomicRmw16CmpxchgU { .. }
+            | Operator::I64AtomicRmw32CmpxchgU { .. }
+            | Operator::I64AtomicRmwCmpxchg { .. }
+            | Operator::MemoryAtomicWait32 { .. }
+            | Operator::MemoryAtomicWait64 { .. }
+            | Operator::MemoryAtomicNotify { .. } => self.translate_atomic_memory_operator(op)?,
+            Operator::RefNull { .. } | Operator::RefIsNull | Operator::RefFunc { .. } => {
+                self.translate_reference_operator(op)?;
+            }
+            Operator::TableGet { .. }
+            | Operator::TableSet { .. }
+            | Operator::TableCopy { .. }
+            | Operator::TableInit { .. }
+            | Operator::ElemDrop { .. }
+            | Operator::TableFill { .. }
+            | Operator::TableGrow { .. }
+            | Operator::TableSize { .. } => self.translate_table_operator(op)?,
+            Operator::TryTable { .. } | Operator::Throw { .. } | Operator::ThrowRef => {
+                self.translate_eh_operator(op)?;
             }
             _ => {
                 return Err(CompileError::Codegen(format!(
@@ -13497,6 +12571,45 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
         }
 
         Ok(())
+    }
+
+    fn build_call_with_param_attributes(
+        &self,
+        function: FunctionValue<'ctx>,
+        args: &[BasicMetadataValueEnum<'ctx>],
+        name: &str,
+    ) -> Result<CallSiteValue<'ctx>, CompileError> {
+        let call = self
+            .builder
+            .build_call(function, args, name)
+            .map_err(|e| CompileError::Codegen(e.to_string()))?;
+
+        // https://five-embeddev.com/riscv-user-isa-manual/Priv-v1.12/rv64.html
+        // > The compiler and calling convention maintain an invariant that all 32-bit values are held in a sign-extended format in 64-bit registers.
+        // > Even 32-bit unsigned integers extend bit 31 into bits 63 through 32. Consequently, conversion between unsigned and signed 32-bit integers
+        // > is a no-op, as is conversion from a signed 32-bit integer to a signed 64-bit integer.
+        if matches!(
+            self.target_triple.architecture,
+            Architecture::Riscv32(..) | Architecture::Riscv64(..)
+        ) {
+            let param_types = function.get_type().get_param_types();
+            for (i, ty) in param_types.into_iter().enumerate() {
+                if ty == self.context.i32_type().into() {
+                    call.add_attribute(
+                        AttributeLoc::Param(i as u32),
+                        self.context
+                            .create_enum_attribute(Attribute::get_named_enum_kind_id("signext"), 0),
+                    );
+                    call.add_attribute(
+                        AttributeLoc::Param(i as u32),
+                        self.context
+                            .create_enum_attribute(Attribute::get_named_enum_kind_id("noundef"), 0),
+                    );
+                }
+            }
+        }
+
+        Ok(call)
     }
 }
 
@@ -13511,42 +12624,3 @@ fn is_f64_arithmetic(bits: u64) -> bool {
     let bits = bits & 0x7FFF_FFFF_FFFF_FFFF;
     bits < 0x7FF8_0000_0000_0000
 }
-
-// Constants for the bounds of truncation operations. These are the least or
-// greatest exact floats in either f32 or f64 representation
-// greater-than-or-equal-to (for least) or less-than-or-equal-to (for greatest)
-// the i32 or i64 or u32 or u64 min (for least) or max (for greatest), when
-// rounding towards zero.
-
-/// Least Exact Float (32 bits) greater-than-or-equal-to i32::MIN when rounding towards zero.
-const LEF32_GEQ_I32_MIN: u64 = i32::MIN as u64;
-/// Greatest Exact Float (32 bits) less-than-or-equal-to i32::MAX when rounding towards zero.
-const GEF32_LEQ_I32_MAX: u64 = 2147483520; // bits as f32: 0x4eff_ffff
-/// Least Exact Float (64 bits) greater-than-or-equal-to i32::MIN when rounding towards zero.
-const LEF64_GEQ_I32_MIN: u64 = i32::MIN as u64;
-/// Greatest Exact Float (64 bits) less-than-or-equal-to i32::MAX when rounding towards zero.
-const GEF64_LEQ_I32_MAX: u64 = i32::MAX as u64;
-/// Least Exact Float (32 bits) greater-than-or-equal-to u32::MIN when rounding towards zero.
-const LEF32_GEQ_U32_MIN: u64 = u32::MIN as u64;
-/// Greatest Exact Float (32 bits) less-than-or-equal-to u32::MAX when rounding towards zero.
-const GEF32_LEQ_U32_MAX: u64 = 4294967040; // bits as f32: 0x4f7f_ffff
-/// Least Exact Float (64 bits) greater-than-or-equal-to u32::MIN when rounding towards zero.
-const LEF64_GEQ_U32_MIN: u64 = u32::MIN as u64;
-/// Greatest Exact Float (64 bits) less-than-or-equal-to u32::MAX when rounding towards zero.
-const GEF64_LEQ_U32_MAX: u64 = 4294967295; // bits as f64: 0x41ef_ffff_ffff_ffff
-/// Least Exact Float (32 bits) greater-than-or-equal-to i64::MIN when rounding towards zero.
-const LEF32_GEQ_I64_MIN: u64 = i64::MIN as u64;
-/// Greatest Exact Float (32 bits) less-than-or-equal-to i64::MAX when rounding towards zero.
-const GEF32_LEQ_I64_MAX: u64 = 9223371487098961920; // bits as f32: 0x5eff_ffff
-/// Least Exact Float (64 bits) greater-than-or-equal-to i64::MIN when rounding towards zero.
-const LEF64_GEQ_I64_MIN: u64 = i64::MIN as u64;
-/// Greatest Exact Float (64 bits) less-than-or-equal-to i64::MAX when rounding towards zero.
-const GEF64_LEQ_I64_MAX: u64 = 9223372036854774784; // bits as f64: 0x43df_ffff_ffff_ffff
-/// Least Exact Float (32 bits) greater-than-or-equal-to u64::MIN when rounding towards zero.
-const LEF32_GEQ_U64_MIN: u64 = u64::MIN;
-/// Greatest Exact Float (32 bits) less-than-or-equal-to u64::MAX when rounding towards zero.
-const GEF32_LEQ_U64_MAX: u64 = 18446742974197923840; // bits as f32: 0x5f7f_ffff
-/// Least Exact Float (64 bits) greater-than-or-equal-to u64::MIN when rounding towards zero.
-const LEF64_GEQ_U64_MIN: u64 = u64::MIN;
-/// Greatest Exact Float (64 bits) less-than-or-equal-to u64::MAX when rounding towards zero.
-const GEF64_LEQ_U64_MAX: u64 = 18446744073709549568; // bits as f64: 0x43ef_ffff_ffff_ffff

@@ -25,6 +25,7 @@ pub mod journal;
 pub mod wasi;
 pub mod wasix;
 
+use bincode::config;
 use bytes::{Buf, BufMut};
 use futures::{
     Future,
@@ -380,7 +381,9 @@ where
             return Poll::Ready(Ok(res));
         }
 
-        WasiEnv::do_pending_link_operations(self.ctx, false);
+        if let Err(err) = WasiEnv::do_pending_link_operations(self.ctx, false) {
+            return Poll::Ready(Err(err));
+        }
 
         let env = self.ctx.data();
         if let Some(forced_exit) = env.thread.try_join() {
@@ -416,6 +419,10 @@ where
                     } else {
                         // Re-subscribe so we get woken up for further signals as well
                         self.ctx.data().thread.signals_subscribe(cx.waker());
+                        // Retry after Sigwakeup drain: dl ops may have started after the check above.
+                        if let Err(err) = WasiEnv::do_pending_link_operations(self.ctx, false) {
+                            return Poll::Ready(Err(err));
+                        }
                         Poll::Pending
                     }
                 }
@@ -547,7 +554,7 @@ where
                     let result = trigger.await;
                     tracing::trace!(%pid, %tid, "thread leaving deep sleep");
                     thread.set_deep_sleeping(false);
-                    bincode::serialize(&result).unwrap().into()
+                    bincode::serde::encode_to_vec(&result, config::legacy()).unwrap().into()
                 }))?;
                 AsyncifyAction::Unwind
             },
@@ -848,6 +855,59 @@ pub(crate) fn write_buffer_array<M: MemorySize>(
     }
 
     Errno::Success
+}
+
+pub(crate) fn read_string_array<M: MemorySize>(
+    memory: &MemoryView,
+    ptrs: WasmPtr<WasmPtr<u8, M>, M>,
+    count: M::Offset,
+) -> Result<Vec<String>, Errno> {
+    if ptrs.is_null() || count == M::ZERO {
+        return Ok(vec![]);
+    }
+
+    let ptr_slice = ptrs.slice(memory, count).map_err(mem_error_to_wasi)?;
+    let capacity = from_offset::<M>(count)?;
+    let mut result = Vec::with_capacity(capacity);
+    for ptr in ptr_slice.access().map_err(mem_error_to_wasi)?.iter() {
+        let s = ptr
+            .read_utf8_string_with_nul(memory)
+            .map_err(mem_error_to_wasi)?;
+        result.push(s);
+    }
+    Ok(result)
+}
+
+pub(crate) fn parse_env_entries(envs: Vec<String>) -> Result<Vec<(String, String)>, Errno> {
+    envs.into_iter()
+        .map(|env| {
+            let (key, value) = env.split_once('=').ok_or(Errno::Inval)?;
+            Ok((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+pub(crate) fn parse_delimited_string_list(s: &str) -> Vec<String> {
+    s.split(&['\n', '\r'])
+        .map(|a| a.to_string())
+        .filter(|a| !a.is_empty())
+        .collect()
+}
+
+pub(crate) fn parse_delimited_exec_args(s: &str) -> Vec<String> {
+    s.trim_end_matches(['\r', '\n'])
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+pub(crate) fn parse_delimited_env_list(s: &str) -> Result<Vec<(String, String)>, Errno> {
+    let envs = s
+        .split(&['\n', '\r'])
+        .map(|a| a.to_string())
+        .filter(|a| !a.is_empty())
+        .collect::<Vec<_>>();
+    parse_env_entries(envs)
 }
 
 pub(crate) fn get_current_time_in_nanos() -> Result<Timestamp, Errno> {
@@ -1162,7 +1222,7 @@ where
     {
         asyncify_start_unwind.call(&mut ctx, asyncify_data);
     } else {
-        warn!("failed to unwind the stack because the asyncify_start_rewind export is missing");
+        warn!("failed to unwind the stack because the asyncify_start_unwind export is missing");
         return Err(WasiError::Exit(Errno::Noexec.into()));
     }
 
@@ -1228,7 +1288,7 @@ where
         {
             asyncify_stop_unwind.call(&mut ctx);
         } else {
-            warn!("failed to unwind the stack because the asyncify_start_rewind export is missing");
+            warn!("failed to unwind the stack because the asyncify_stop_unwind export is missing");
             return Ok(OnCalledAction::Finish);
         }
 
@@ -1251,7 +1311,9 @@ pub fn rewind<M: MemorySize, T>(
 where
     T: serde::Serialize,
 {
-    let rewind_result = bincode::serialize(&result).unwrap().into();
+    let rewind_result = bincode::serde::encode_to_vec(&result, config::legacy())
+        .unwrap()
+        .into();
     rewind_ext::<M>(
         &mut ctx,
         memory_stack,
@@ -1441,12 +1503,12 @@ where
         if let Some(asyncify_stop_rewind) = env
             .inner()
             .static_module_instance_handles()
-            .and_then(|handles| handles.asyncify_stop_unwind.clone())
+            .and_then(|handles| handles.asyncify_stop_rewind.clone())
         {
             asyncify_stop_rewind.call(ctx);
         } else {
             warn!(
-                "failed to handle rewind because the asyncify_start_rewind export is missing or inaccessible"
+                "failed to handle rewind because the asyncify_stop_rewind export is missing or inaccessible"
             );
             return Some(None);
         }
@@ -1468,7 +1530,7 @@ where
             }
             RewindResultType::RewindWithResult(rewind_result) => {
                 tracing::trace!(%pid, %tid, "rewind with result (data={})", rewind_result.len());
-                let ret = bincode::deserialize(&rewind_result)
+                let (ret, _) = bincode::serde::decode_from_slice(&rewind_result, config::legacy())
                     .expect("failed to deserialize the rewind result");
                 Some(Some(ret))
             }

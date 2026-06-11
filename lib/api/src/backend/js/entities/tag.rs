@@ -15,7 +15,7 @@ pub(crate) struct Tag {
 unsafe impl Send for Tag {}
 unsafe impl Sync for Tag {}
 
-// Tag can't be Send in js because it dosen't support `structuredClone`
+// Tag can't be Send in js because it doesn't support `structuredClone`
 // https://developer.mozilla.org/en-US/docs/Web/API/structuredClone
 // unsafe impl Send for Tag {}
 
@@ -47,7 +47,7 @@ impl Tag {
 
     pub(crate) fn from_vm_extern(store: &mut impl AsStoreMut, vm_extern: VMExternTag) -> Self {
         Self {
-            handle: vm_extern.into_js(),
+            handle: vm_extern.unwrap_js(),
         }
     }
 

@@ -57,7 +57,7 @@ impl UnwindRegistry {
     }
 
     /// Publishes all registered functions.
-    pub fn publish(&mut self, _eh_frame: Option<&[u8]>) -> Result<(), String> {
+    pub fn publish_eh_frame(&mut self, _eh_frame: Option<&[u8]>) -> Result<(), String> {
         if self.published {
             return Err("unwind registry has already been published".to_string());
         }
@@ -73,28 +73,15 @@ impl UnwindRegistry {
                     "function table allocation was not aligned"
                 );
                 unsafe {
-                    if RtlAddFunctionTable(
+                    if !RtlAddFunctionTable(
                         functions.as_mut_ptr(),
                         functions.len() as u32,
                         *base_address as u64,
-                    ) == 0
-                    {
+                    ) {
                         return Err("failed to register function tables".to_string());
                     }
                 }
             }
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn register_compact_unwind(
-        &mut self,
-        compact_unwind: Option<&[u8]>,
-        _eh_personality_addr_in_got: Option<usize>,
-    ) -> Result<(), String> {
-        if compact_unwind.is_some() {
-            return Err("Cannot register compact_unwind frames on Windows platforms".to_string());
         }
 
         Ok(())

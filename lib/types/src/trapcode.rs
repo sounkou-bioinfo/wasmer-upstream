@@ -66,6 +66,16 @@ pub enum TrapCode {
 
     /// A throw_ref was executed but the exnref was not initialized.
     UninitializedExnRef = 12,
+
+    /// An async imported function tried to yield when not called
+    /// via `Function::call_async`.
+    YieldOutsideAsyncContext = 13,
+
+    /// Another host thread requested interruption of running WASM.
+    HostInterrupt = 14,
+
+    /// A table modification operation for a read-only table.
+    ReadonlyTableModified = 15,
 }
 
 impl TrapCode {
@@ -85,6 +95,11 @@ impl TrapCode {
             Self::UnalignedAtomic => "unaligned atomic access",
             Self::UncaughtException => "uncaught exception",
             Self::UninitializedExnRef => "uninitialized exnref",
+            Self::YieldOutsideAsyncContext => {
+                "async imported function yielded when not called via `Function::call_async`"
+            }
+            Self::HostInterrupt => "interrupted by host",
+            Self::ReadonlyTableModified => "read-only table modified",
         }
     }
 }
@@ -105,6 +120,9 @@ impl Display for TrapCode {
             Self::UnalignedAtomic => "unalign_atom",
             Self::UncaughtException => "uncaught_exception",
             Self::UninitializedExnRef => "uninitialized_exnref",
+            Self::YieldOutsideAsyncContext => "yield_outside_async_context",
+            Self::HostInterrupt => "host_interrupt",
+            Self::ReadonlyTableModified => "readonly_table_modified",
         };
         f.write_str(identifier)
     }
@@ -128,6 +146,8 @@ impl FromStr for TrapCode {
             "unalign_atom" => Ok(Self::UnalignedAtomic),
             "uncaught_exception" => Ok(Self::UncaughtException),
             "uninitialized_exnref" => Ok(Self::UninitializedExnRef),
+            "yield_outside_async_context" => Ok(Self::YieldOutsideAsyncContext),
+            "host_interrupt" => Ok(Self::HostInterrupt),
             _ => Err(()),
         }
     }

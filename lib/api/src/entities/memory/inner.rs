@@ -1,4 +1,4 @@
-use super::{shared::SharedMemory, view::*};
+use super::{SharedMemory, shared_memory_detach_error, view::*};
 use wasmer_types::{MemoryError, MemoryType, Pages};
 
 use crate::{
@@ -7,10 +7,11 @@ use crate::{
     vm::{VMExtern, VMExternMemory, VMMemory},
 };
 
-gen_rt_ty!(Memory
-    @cfg feature = "artifact-size" => derive(loupe::MemoryUsage)
-    @derives Debug, Clone, PartialEq, Eq, derive_more::From
-);
+gen_rt_ty! {
+    #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+    #[derive(Debug, Clone, PartialEq, Eq, derive_more::From)]
+    pub BackendMemory(entities::memory::Memory);
+}
 
 impl BackendMemory {
     /// Creates a new host [`BackendMemory`] from the provided [`MemoryType`].
@@ -33,14 +34,6 @@ impl BackendMemory {
             crate::BackendStore::Sys(s) => Ok(Self::Sys(
                 crate::backend::sys::entities::memory::Memory::new(store, ty)?,
             )),
-            #[cfg(feature = "wamr")]
-            crate::BackendStore::Wamr(s) => Ok(Self::Wamr(
-                crate::backend::wamr::entities::memory::Memory::new(store, ty)?,
-            )),
-            #[cfg(feature = "wasmi")]
-            crate::BackendStore::Wasmi(s) => Ok(Self::Wasmi(
-                crate::backend::wasmi::entities::memory::Memory::new(store, ty)?,
-            )),
             #[cfg(feature = "v8")]
             crate::BackendStore::V8(s) => Ok(Self::V8(
                 crate::backend::v8::entities::memory::Memory::new(store, ty)?,
@@ -48,10 +41,6 @@ impl BackendMemory {
             #[cfg(feature = "js")]
             crate::BackendStore::Js(s) => Ok(Self::Js(
                 crate::backend::js::entities::memory::Memory::new(store, ty)?,
-            )),
-            #[cfg(feature = "jsc")]
-            crate::BackendStore::Jsc(s) => Ok(Self::Jsc(
-                crate::backend::jsc::entities::memory::Memory::new(store, ty)?,
             )),
         }
     }
@@ -64,42 +53,21 @@ impl BackendMemory {
             crate::BackendStore::Sys(_) => Self::Sys(
                 crate::backend::sys::entities::memory::Memory::new_from_existing(
                     new_store,
-                    memory.into_sys(),
-                ),
-            ),
-            #[cfg(feature = "wamr")]
-            crate::BackendStore::Wamr(_) => Self::Wamr(
-                crate::backend::wamr::entities::memory::Memory::new_from_existing(
-                    new_store,
-                    memory.into_wamr(),
-                ),
-            ),
-            #[cfg(feature = "wasmi")]
-            crate::BackendStore::Wasmi(_) => Self::Wasmi(
-                crate::backend::wasmi::entities::memory::Memory::new_from_existing(
-                    new_store,
-                    memory.into_wasmi(),
+                    memory.unwrap_sys(),
                 ),
             ),
             #[cfg(feature = "v8")]
             crate::BackendStore::V8(_) => Self::V8(
                 crate::backend::v8::entities::memory::Memory::new_from_existing(
                     new_store,
-                    memory.into_v8(),
+                    memory.unwrap_v_8(),
                 ),
             ),
             #[cfg(feature = "js")]
             crate::BackendStore::Js(_) => Self::Js(
                 crate::backend::js::entities::memory::Memory::new_from_existing(
                     new_store,
-                    memory.into_js(),
-                ),
-            ),
-            #[cfg(feature = "jsc")]
-            crate::BackendStore::Jsc(_) => Self::Jsc(
-                crate::backend::jsc::entities::memory::Memory::new_from_existing(
-                    new_store,
-                    memory.into_jsc(),
+                    memory.unwrap_js(),
                 ),
             ),
         }
@@ -202,51 +170,20 @@ impl BackendMemory {
         })
     }
 
-    /// Attempts to duplicate this memory (if its clonable) in a new store
-    /// (copied memory)
+    /// Attempts to duplicate this memory in a new store with a byte-for-byte copy
     #[inline]
+    #[deprecated(
+        since = "8.0.0",
+        note = "Since `Store` is no longer `Send + Sync`, this method cannot be used meaningfully. \
+                Use `copy`, then `attach` on the thread owning the other `Store` instead."
+    )]
     pub fn copy_to_store(
         &self,
         store: &impl AsStoreRef,
         new_store: &mut impl AsStoreMut,
     ) -> Result<Self, MemoryError> {
-        if !self.ty(store).shared {
-            // We should only be able to duplicate in a new store if the memory is shared
-            return Err(MemoryError::InvalidMemory {
-                reason: "memory is not a shared memory type".to_string(),
-            });
-        }
-
-        match self {
-            #[cfg(feature = "sys")]
-            Self::Sys(s) => s.try_copy(store).map(|new_memory| {
-                Self::new_from_existing(
-                    new_store,
-                    VMMemory::Sys(crate::backend::sys::vm::VMMemory(new_memory)),
-                )
-            }),
-            #[cfg(feature = "wamr")]
-            Self::Wamr(s) => s
-                .try_copy(store)
-                .map(|new_memory| Self::new_from_existing(new_store, VMMemory::Wamr(new_memory))),
-            #[cfg(feature = "wasmi")]
-            Self::Wasmi(s) => s
-                .try_copy(store)
-                .map(|new_memory| Self::new_from_existing(new_store, VMMemory::Wasmi(new_memory))),
-
-            #[cfg(feature = "v8")]
-            Self::V8(s) => s
-                .try_copy(store)
-                .map(|new_memory| Self::new_from_existing(new_store, VMMemory::V8(new_memory))),
-            #[cfg(feature = "js")]
-            Self::Js(s) => s
-                .try_copy(store)
-                .map(|new_memory| Self::new_from_existing(new_store, VMMemory::Js(new_memory))),
-            #[cfg(feature = "jsc")]
-            Self::Jsc(s) => s
-                .try_copy(store)
-                .map(|new_memory| Self::new_from_existing(new_store, VMMemory::Jsc(new_memory))),
-        }
+        self.copy(store)
+            .map(|new_memory| new_memory.attach(new_store).0)
     }
 
     #[inline]
@@ -256,14 +193,6 @@ impl BackendMemory {
             crate::BackendStore::Sys(s) => Self::Sys(
                 crate::backend::sys::entities::memory::Memory::from_vm_extern(store, vm_extern),
             ),
-            #[cfg(feature = "wamr")]
-            crate::BackendStore::Wamr(s) => Self::Wamr(
-                crate::backend::wamr::entities::memory::Memory::from_vm_extern(store, vm_extern),
-            ),
-            #[cfg(feature = "wasmi")]
-            crate::BackendStore::Wasmi(s) => Self::Wasmi(
-                crate::backend::wasmi::entities::memory::Memory::from_vm_extern(store, vm_extern),
-            ),
             #[cfg(feature = "v8")]
             crate::BackendStore::V8(s) => Self::V8(
                 crate::backend::v8::entities::memory::Memory::from_vm_extern(store, vm_extern),
@@ -271,10 +200,6 @@ impl BackendMemory {
             #[cfg(feature = "js")]
             crate::BackendStore::Js(s) => Self::Js(
                 crate::backend::js::entities::memory::Memory::from_vm_extern(store, vm_extern),
-            ),
-            #[cfg(feature = "jsc")]
-            crate::BackendStore::Jsc(s) => Self::Jsc(
-                crate::backend::jsc::entities::memory::Memory::from_vm_extern(store, vm_extern),
             ),
         }
     }
@@ -287,71 +212,35 @@ impl BackendMemory {
         })
     }
 
-    /// Attempt to create a new reference to the underlying memory; this new reference can then be
-    /// used within a different store (from the same implementer).
-    ///
-    /// # Errors
-    ///
-    /// Fails if the underlying memory is not clonable.
+    /// Attempts to create a detached copied memory handle that can later be
+    /// attached to a different store.
     #[inline]
-    pub fn try_clone(&self, store: &impl AsStoreRef) -> Result<VMMemory, MemoryError> {
-        match self {
-            #[cfg(feature = "sys")]
-            Self::Sys(s) => s.try_clone(store).map(VMMemory::Sys),
-            #[cfg(feature = "wamr")]
-            Self::Wamr(s) => s.try_clone(store).map(VMMemory::Wamr),
-            #[cfg(feature = "wasmi")]
-            Self::Wasmi(s) => s.try_clone(store).map(VMMemory::Wasmi),
-            #[cfg(feature = "v8")]
-            Self::V8(s) => s.try_clone(store).map(VMMemory::V8),
-            #[cfg(feature = "js")]
-            Self::Js(s) => s.try_clone(store).map(VMMemory::Js),
-            #[cfg(feature = "jsc")]
-            Self::Jsc(s) => s.try_clone(store).map(VMMemory::Jsc),
-        }
+    pub fn copy(&self, store: &impl AsStoreRef) -> Result<SharedMemory, MemoryError> {
+        match_rt!(on self => s {
+            s.copy(store)
+        })
     }
 
-    /// Attempts to clone this memory (if its clonable) in a new store
+    /// Attempts to clone this memory (if its cloneable) in a new store
     /// (cloned memory will be shared between those that clone it)
     #[inline]
+    #[deprecated(
+        since = "8.0.0",
+        note = "Since `Store` is no longer `Send + Sync`, this method cannot be used meaningfully. \
+                Use `as_shared`, then `attach` on the thread owning the other `Store` instead."
+    )]
     pub fn share_in_store(
         &self,
         store: &impl AsStoreRef,
         new_store: &mut impl AsStoreMut,
     ) -> Result<Self, MemoryError> {
         if !self.ty(store).shared {
-            // We should only be able to duplicate in a new store if the memory is shared
-            return Err(MemoryError::InvalidMemory {
-                reason: "memory is not a shared memory type".to_string(),
-            });
+            return Err(MemoryError::MemoryNotShared);
         }
 
-        match self {
-            #[cfg(feature = "sys")]
-            Self::Sys(s) => s
-                .try_clone(store)
-                .map(|new_memory| Self::new_from_existing(new_store, VMMemory::Sys(new_memory))),
-            #[cfg(feature = "wamr")]
-            Self::Wamr(s) => s
-                .try_clone(store)
-                .map(|new_memory| Self::new_from_existing(new_store, VMMemory::Wamr(new_memory))),
-            #[cfg(feature = "wasmi")]
-            Self::Wasmi(s) => s
-                .try_clone(store)
-                .map(|new_memory| Self::new_from_existing(new_store, VMMemory::Wasmi(new_memory))),
-            #[cfg(feature = "v8")]
-            Self::V8(s) => s
-                .try_clone(store)
-                .map(|new_memory| Self::new_from_existing(new_store, VMMemory::V8(new_memory))),
-            #[cfg(feature = "js")]
-            Self::Js(s) => s
-                .try_clone(store)
-                .map(|new_memory| Self::new_from_existing(new_store, VMMemory::Js(new_memory))),
-            #[cfg(feature = "jsc")]
-            Self::Jsc(s) => s
-                .try_clone(store)
-                .map(|new_memory| Self::new_from_existing(new_store, VMMemory::Jsc(new_memory))),
-        }
+        self.as_shared(store)
+            .ok_or_else(shared_memory_detach_error)
+            .map(|new_memory| new_memory.attach(new_store).0)
     }
 
     /// Get a [`SharedMemory`].
@@ -367,7 +256,7 @@ impl BackendMemory {
         }
 
         match_rt!(on self => s {
-            s.as_shared(store)
+            s.as_shared(store).ok()
         })
     }
 

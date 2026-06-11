@@ -117,7 +117,7 @@ file handles (which is needed for stdin and stdout redirection)
 
 ```sh
 cd ../../cli
-cargo run --features compiler,cranelift,debug -- --use sharrattj/coreutils --enable-threads ../wasix/tests/example
+cargo run --features compiler,cranelift,debug -- --use wasmer/coreutils --enable-threads ../wasix/tests/example
 -execve.wasm
 ```
 
@@ -154,7 +154,7 @@ Expected:
 (A4) r=10003
 ```
 
-## Yet another longjmp implemenation
+## Yet another longjmp implementation
 
 This one is initiated from `rust` code and thus has the risk of leaking memory but uses different interfaces
 
@@ -299,7 +299,7 @@ Uses `posix_spawn` to launch a sub-process and wait on it to exit
 
 ```sh
 cd ../../cli
-cargo run --features compiler,cranelift,debug -- --enable-threads --use sharrattj/coreutils ../wasix/tests/example
+cargo run --features compiler,cranelift,debug -- --enable-threads --use wasmer/coreutils ../wasix/tests/example
 -spawn.wasm
 ```
 
@@ -440,7 +440,7 @@ and mapped directories to serve HTTP content.
 
 ```sh
 cd ../../cli
-cargo run --features compiler,cranelift,debug -- --enable-threads --mapdir /public:/prog/deploy/wasmer-web/public ../wasix/tests/web-server.wasm -- --port 8080 --log-level trace
+cargo run --features compiler,cranelift,debug -- --enable-threads --volume /prog/deploy/wasmer-web/public:/public ../wasix/tests/web-server.wasm -- --port 8080 --log-level trace
 ```
 
 Note: This requires that a curl command be made to the HTTP server asynchronously

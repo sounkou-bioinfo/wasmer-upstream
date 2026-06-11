@@ -15,7 +15,7 @@ use crate::{VMBuiltinFunctionIndex, VMFunction};
 use std::convert::TryFrom;
 use std::hash::{Hash, Hasher};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use wasmer_types::RawValue;
 
 /// Union representing the first parameter passed when calling a function.
@@ -72,6 +72,9 @@ pub struct VMFunctionImport {
 
     /// Handle to the `VMFunction` in the context.
     pub handle: InternalStoreHandle<VMFunction>,
+
+    /// Flag if the function requires extra the m0 argument (used for m0 optimization dispatch).
+    pub include_m0_param: bool,
 }
 
 #[cfg(test)]
@@ -408,8 +411,7 @@ pub(crate) unsafe fn memory32_atomic_check32(
         // Bounds and casts are checked above, by this point we know that
         // everything is safe.
         let dst = mem.base.offset(dst) as *mut u32;
-        let atomic_dst = AtomicPtr::new(dst);
-        let read_val = *atomic_dst.load(Ordering::Acquire);
+        let read_val = AtomicU32::from_ptr(dst).load(Ordering::Acquire);
         let ret = if read_val == val { 0 } else { 1 };
         Ok(ret)
     }
@@ -441,8 +443,7 @@ pub(crate) unsafe fn memory32_atomic_check64(
         // Bounds and casts are checked above, by this point we know that
         // everything is safe.
         let dst = mem.base.offset(dst) as *mut u64;
-        let atomic_dst = AtomicPtr::new(dst);
-        let read_val = *atomic_dst.load(Ordering::Acquire);
+        let read_val = AtomicU64::from_ptr(dst).load(Ordering::Acquire);
         let ret = if read_val == val { 0 } else { 1 };
         Ok(ret)
     }
@@ -521,7 +522,7 @@ mod test_vmglobal_definition {
         let module = ModuleInfo::new();
         let offsets = VMOffsets::new(size_of::<*mut u8>() as u8, &module);
         assert_eq!(
-            size_of::<*const VMGlobalDefinition>(),
+            size_of::<VMGlobalDefinition>(),
             usize::from(offsets.size_of_vmglobal_local())
         );
     }
@@ -566,43 +567,12 @@ impl VMSharedTagIndex {
 #[repr(C)]
 #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 #[derive(Debug, Eq, PartialEq, Clone, Copy, Hash)]
-pub struct VMSharedSignatureIndex(u32);
+pub struct VMSignatureHash(u32);
 
-#[cfg(test)]
-mod test_vmshared_signature_index {
-    use super::VMSharedSignatureIndex;
-    use std::mem::size_of;
-    use wasmer_types::{ModuleInfo, TargetSharedSignatureIndex, VMOffsets};
-
-    #[test]
-    fn check_vmshared_signature_index() {
-        let module = ModuleInfo::new();
-        let offsets = VMOffsets::new(size_of::<*mut u8>() as u8, &module);
-        assert_eq!(
-            size_of::<VMSharedSignatureIndex>(),
-            usize::from(offsets.size_of_vmshared_signature_index())
-        );
-    }
-
-    #[test]
-    fn check_target_shared_signature_index() {
-        assert_eq!(
-            size_of::<VMSharedSignatureIndex>(),
-            size_of::<TargetSharedSignatureIndex>()
-        );
-    }
-}
-
-impl VMSharedSignatureIndex {
-    /// Create a new `VMSharedSignatureIndex`.
+impl VMSignatureHash {
+    /// Create a new `VMSignatureHash`.
     pub fn new(value: u32) -> Self {
         Self(value)
-    }
-}
-
-impl Default for VMSharedSignatureIndex {
-    fn default() -> Self {
-        Self::new(u32::MAX)
     }
 }
 
@@ -615,7 +585,7 @@ pub struct VMCallerCheckedAnyfunc {
     /// Function body.
     pub func_ptr: *const VMFunctionBody,
     /// Function signature id.
-    pub type_index: VMSharedSignatureIndex,
+    pub type_signature_hash: VMSignatureHash,
     /// Function `VMContext` or host env.
     pub vmctx: VMFunctionContext,
     /// Address of the function call trampoline to invoke this function using
@@ -624,10 +594,32 @@ pub struct VMCallerCheckedAnyfunc {
     // If more elements are added here, remember to add offset_of tests below!
 }
 
+unsafe extern "C" fn null_call_trampoline(
+    _vmctx: *mut VMContext,
+    _callee: *const VMFunctionBody,
+    _values: *mut RawValue,
+) {
+    unreachable!("null funcref trampoline should never be invoked");
+}
+
+impl VMCallerCheckedAnyfunc {
+    /// Construct the sentinel value for an uninitialized `funcref` table entry.
+    pub fn null() -> Self {
+        Self {
+            func_ptr: ptr::null(),
+            type_signature_hash: VMSignatureHash(0),
+            vmctx: VMFunctionContext {
+                host_env: ptr::null_mut(),
+            },
+            call_trampoline: null_call_trampoline,
+        }
+    }
+}
+
 impl PartialEq for VMCallerCheckedAnyfunc {
     fn eq(&self, other: &Self) -> bool {
         self.func_ptr == other.func_ptr
-            && self.type_index == other.type_index
+            && self.type_signature_hash == other.type_signature_hash
             && self.vmctx == other.vmctx
             && ptr::fn_addr_eq(self.call_trampoline, other.call_trampoline)
     }
@@ -638,7 +630,7 @@ impl Eq for VMCallerCheckedAnyfunc {}
 impl Hash for VMCallerCheckedAnyfunc {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.func_ptr.hash(state);
-        self.type_index.hash(state);
+        self.type_signature_hash.hash(state);
         self.vmctx.hash(state);
         ptr::hash(self.call_trampoline as *const (), state);
     }
@@ -665,8 +657,8 @@ mod test_vmcaller_checked_anyfunc {
             usize::from(offsets.vmcaller_checked_anyfunc_func_ptr())
         );
         assert_eq!(
-            offset_of!(VMCallerCheckedAnyfunc, type_index),
-            usize::from(offsets.vmcaller_checked_anyfunc_type_index())
+            offset_of!(VMCallerCheckedAnyfunc, type_signature_hash),
+            usize::from(offsets.vmcaller_checked_anyfunc_signature_hash())
         );
         assert_eq!(
             offset_of!(VMCallerCheckedAnyfunc, vmctx),
@@ -692,76 +684,80 @@ impl VMBuiltinFunctionsArray {
 
         let mut ptrs = [0; Self::len()];
 
-        ptrs[VMBuiltinFunctionIndex::get_memory32_grow_index().index() as usize] =
-            wasmer_vm_memory32_grow as usize;
-        ptrs[VMBuiltinFunctionIndex::get_imported_memory32_grow_index().index() as usize] =
-            wasmer_vm_imported_memory32_grow as usize;
-
-        ptrs[VMBuiltinFunctionIndex::get_memory32_size_index().index() as usize] =
-            wasmer_vm_memory32_size as usize;
-        ptrs[VMBuiltinFunctionIndex::get_imported_memory32_size_index().index() as usize] =
-            wasmer_vm_imported_memory32_size as usize;
-
-        ptrs[VMBuiltinFunctionIndex::get_table_copy_index().index() as usize] =
-            wasmer_vm_table_copy as usize;
-
-        ptrs[VMBuiltinFunctionIndex::get_table_init_index().index() as usize] =
-            wasmer_vm_table_init as usize;
-        ptrs[VMBuiltinFunctionIndex::get_elem_drop_index().index() as usize] =
-            wasmer_vm_elem_drop as usize;
-
-        ptrs[VMBuiltinFunctionIndex::get_memory_copy_index().index() as usize] =
-            wasmer_vm_memory32_copy as usize;
-        ptrs[VMBuiltinFunctionIndex::get_imported_memory_copy_index().index() as usize] =
-            wasmer_vm_imported_memory32_copy as usize;
-        ptrs[VMBuiltinFunctionIndex::get_memory_fill_index().index() as usize] =
-            wasmer_vm_memory32_fill as usize;
-        ptrs[VMBuiltinFunctionIndex::get_imported_memory_fill_index().index() as usize] =
-            wasmer_vm_imported_memory32_fill as usize;
-        ptrs[VMBuiltinFunctionIndex::get_memory_init_index().index() as usize] =
-            wasmer_vm_memory32_init as usize;
-        ptrs[VMBuiltinFunctionIndex::get_data_drop_index().index() as usize] =
-            wasmer_vm_data_drop as usize;
-        ptrs[VMBuiltinFunctionIndex::get_raise_trap_index().index() as usize] =
-            wasmer_vm_raise_trap as usize;
-        ptrs[VMBuiltinFunctionIndex::get_table_size_index().index() as usize] =
-            wasmer_vm_table_size as usize;
-        ptrs[VMBuiltinFunctionIndex::get_imported_table_size_index().index() as usize] =
-            wasmer_vm_imported_table_size as usize;
-        ptrs[VMBuiltinFunctionIndex::get_table_grow_index().index() as usize] =
-            wasmer_vm_table_grow as usize;
-        ptrs[VMBuiltinFunctionIndex::get_imported_table_grow_index().index() as usize] =
-            wasmer_vm_imported_table_grow as usize;
-        ptrs[VMBuiltinFunctionIndex::get_table_get_index().index() as usize] =
-            wasmer_vm_table_get as usize;
-        ptrs[VMBuiltinFunctionIndex::get_imported_table_get_index().index() as usize] =
-            wasmer_vm_imported_table_get as usize;
+        ptrs[VMBuiltinFunctionIndex::get_memory32_grow_index().index() as *const () as usize] =
+            wasmer_vm_memory32_grow as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_memory32_grow_index().index() as *const ()
+            as usize] = wasmer_vm_imported_memory32_grow as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_memory32_size_index().index() as *const () as usize] =
+            wasmer_vm_memory32_size as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_memory32_size_index().index() as *const ()
+            as usize] = wasmer_vm_imported_memory32_size as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_table_copy_index().index() as *const () as usize] =
+            wasmer_vm_table_copy as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_table_init_index().index() as *const () as usize] =
+            wasmer_vm_table_init as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_elem_drop_index().index() as *const () as usize] =
+            wasmer_vm_elem_drop as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_memory_copy_index().index() as *const () as usize] =
+            wasmer_vm_memory32_copy as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_memory_copy_index().index() as *const ()
+            as usize] = wasmer_vm_imported_memory32_copy as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_memory_fill_index().index() as *const () as usize] =
+            wasmer_vm_memory32_fill as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_memory_fill_index().index() as *const ()
+            as usize] = wasmer_vm_imported_memory32_fill as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_memory_init_index().index() as *const () as usize] =
+            wasmer_vm_memory32_init as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_data_drop_index().index() as *const () as usize] =
+            wasmer_vm_data_drop as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_raise_trap_index().index() as *const () as usize] =
+            wasmer_vm_raise_trap as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_table_size_index().index() as *const () as usize] =
+            wasmer_vm_table_size as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_table_size_index().index() as *const ()
+            as usize] = wasmer_vm_imported_table_size as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_table_grow_index().index() as *const () as usize] =
+            wasmer_vm_table_grow as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_table_grow_index().index() as *const ()
+            as usize] = wasmer_vm_imported_table_grow as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_table_get_index().index() as *const () as usize] =
+            wasmer_vm_table_get as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_table_get_index().index() as *const ()
+            as usize] = wasmer_vm_imported_table_get as *const () as usize;
         ptrs[VMBuiltinFunctionIndex::get_table_set_index().index() as usize] =
-            wasmer_vm_table_set as usize;
+            wasmer_vm_table_set as *const () as usize;
         ptrs[VMBuiltinFunctionIndex::get_imported_table_set_index().index() as usize] =
-            wasmer_vm_imported_table_set as usize;
+            wasmer_vm_imported_table_set as *const () as usize;
         ptrs[VMBuiltinFunctionIndex::get_func_ref_index().index() as usize] =
-            wasmer_vm_func_ref as usize;
+            wasmer_vm_func_ref as *const () as usize;
         ptrs[VMBuiltinFunctionIndex::get_table_fill_index().index() as usize] =
-            wasmer_vm_table_fill as usize;
-
+            wasmer_vm_table_fill as *const () as usize;
         ptrs[VMBuiltinFunctionIndex::get_memory_atomic_wait32_index().index() as usize] =
-            wasmer_vm_memory32_atomic_wait32 as usize;
+            wasmer_vm_memory32_atomic_wait32 as *const () as usize;
         ptrs[VMBuiltinFunctionIndex::get_imported_memory_atomic_wait32_index().index() as usize] =
-            wasmer_vm_imported_memory32_atomic_wait32 as usize;
+            wasmer_vm_imported_memory32_atomic_wait32 as *const () as usize;
         ptrs[VMBuiltinFunctionIndex::get_memory_atomic_wait64_index().index() as usize] =
-            wasmer_vm_memory32_atomic_wait64 as usize;
+            wasmer_vm_memory32_atomic_wait64 as *const () as usize;
         ptrs[VMBuiltinFunctionIndex::get_imported_memory_atomic_wait64_index().index() as usize] =
-            wasmer_vm_imported_memory32_atomic_wait64 as usize;
+            wasmer_vm_imported_memory32_atomic_wait64 as *const () as usize;
         ptrs[VMBuiltinFunctionIndex::get_memory_atomic_notify_index().index() as usize] =
-            wasmer_vm_memory32_atomic_notify as usize;
+            wasmer_vm_memory32_atomic_notify as *const () as usize;
         ptrs[VMBuiltinFunctionIndex::get_imported_memory_atomic_notify_index().index() as usize] =
-            wasmer_vm_imported_memory32_atomic_notify as usize;
-
+            wasmer_vm_imported_memory32_atomic_notify as *const () as usize;
         ptrs[VMBuiltinFunctionIndex::get_imported_debug_usize_index().index() as usize] =
-            wasmer_vm_dbg_usize as usize;
+            wasmer_vm_dbg_usize as *const () as usize;
         ptrs[VMBuiltinFunctionIndex::get_imported_debug_str_index().index() as usize] =
-            wasmer_vm_dbg_str as usize;
+            wasmer_vm_dbg_str as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_personality2_index().index() as usize] =
+            wasmer_eh_personality2 as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_alloc_exception_index().index() as usize] =
+            wasmer_vm_alloc_exception as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_throw_index().index() as usize] =
+            wasmer_vm_throw as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_read_exnref_index().index() as usize] =
+            wasmer_vm_read_exnref as *const () as usize;
+        ptrs[VMBuiltinFunctionIndex::get_imported_exception_into_exnref_index().index() as usize] =
+            wasmer_vm_exception_into_exnref as *const () as usize;
 
         debug_assert!(ptrs.iter().cloned().all(|p| p != 0));
 

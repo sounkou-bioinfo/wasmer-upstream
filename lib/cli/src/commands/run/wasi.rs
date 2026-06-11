@@ -9,9 +9,13 @@ use std::{
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::Parser;
+use itertools::Itertools;
 use tokio::runtime::Handle;
 use url::Url;
-use virtual_fs::{DeviceFile, FileSystem, PassthruFileSystem, RootFileSystemBuilder};
+use virtual_fs::{
+    ArcFileSystem, DeviceFile, FileSystem, MountFileSystem, OverlayFileSystem,
+    RootFileSystemBuilder,
+};
 use virtual_net::ruleset::Ruleset;
 use wasmer::{Engine, Function, Instance, Memory32, Memory64, Module, RuntimeError, Store, Value};
 use wasmer_config::package::PackageSource as PackageSpecifier;
@@ -23,13 +27,13 @@ use wasmer_wasix::{
     WasiVersion,
     bin_factory::BinaryPackage,
     capabilities::Capabilities,
-    default_fs_backing, get_wasi_versions,
+    get_wasi_versions,
     http::HttpClient,
     journal::{CompactingLogFileJournal, DynJournal, DynReadableJournal},
     os::{TtyBridge, tty_sys::SysTty},
     rewind_ext,
     runners::MAPPED_CURRENT_DIR_DEFAULT_PATH,
-    runners::{MappedCommand, MappedDirectory},
+    runners::{MappedCommand, MappedDirectory, MountedDirectory},
     runtime::{
         module_cache::{FileSystemCache, ModuleCache},
         package_loader::{BuiltinPackageLoader, PackageLoader},
@@ -47,7 +51,7 @@ use wasmer_wasix::{
 
 use crate::{
     config::{UserRegistry, WasmerEnv},
-    utils::{parse_envvar, parse_mapdir},
+    utils::{parse_envvar, parse_mapdir, parse_volume},
 };
 
 use super::{
@@ -60,16 +64,24 @@ const WAPM_SOURCE_CACHE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 #[derive(Debug, Parser, Clone, Default)]
 /// WASI Options
 pub struct Wasi {
-    /// WASI pre-opened directories
-    #[clap(long = "dir", name = "DIR", group = "wasi")]
-    pub(crate) pre_opened_directories: Vec<PathBuf>,
-
     /// Map a host directory to a different location for the Wasm module
     #[clap(
-        long = "mapdir",
-        name = "GUEST_DIR:HOST_DIR",
-        value_parser=parse_mapdir,
+        long = "volume",
+        name = "[HOST_DIR:]GUEST_DIR",
+        value_parser = parse_volume,
     )]
+    pub(crate) volumes: Vec<MappedDirectory>,
+
+    // Legacy option
+    #[clap(long = "dir", group = "wasi", hide = true)]
+    pub(crate) pre_opened_directories: Vec<PathBuf>,
+
+    // Legacy option
+    #[clap(
+        long = "mapdir",
+        value_parser = parse_mapdir,
+        hide = true
+     )]
     pub(crate) mapped_dirs: Vec<MappedDirectory>,
 
     /// Set the module's initial CWD to this path; does not work with
@@ -129,9 +141,17 @@ pub struct Wasi {
     #[clap(long = "no-tty")]
     pub no_tty: bool,
 
-    /// Enables asynchronous threading
-    #[clap(long = "enable-async-threads")]
-    pub enable_async_threads: bool,
+    /// Enables or disables asynchronous threading.
+    ///
+    /// If omitted, the runtime default is used.
+    #[clap(
+        long = "enable-async-threads",
+        require_equals = true,
+        default_missing_value = "true",
+        num_args = 0..=1,
+        action = clap::ArgAction::Set
+    )]
+    pub enable_async_threads: Option<bool>,
 
     /// Enables an exponential backoff (measured in milli-seconds) of
     /// the process CPU usage when there are no active run tokens (when set
@@ -239,10 +259,17 @@ pub struct RunProperties {
     pub args: Vec<String>,
 }
 
+fn endpoint_to_folder(url: &Url) -> String {
+    url.to_string()
+        .replace("registry.wasmer.io", "wasmer.io")
+        .replace("registry.wasmer.wtf", "wasmer.wtf")
+        .replace(|c| "/:?&=#%\\".contains(c), "_")
+}
+
 #[allow(dead_code)]
 impl Wasi {
     pub fn map_dir(&mut self, alias: &str, target_on_disk: PathBuf) {
-        self.mapped_dirs.push(MappedDirectory {
+        self.volumes.push(MappedDirectory {
             guest: alias.to_string(),
             host: target_on_disk,
         });
@@ -266,6 +293,18 @@ impl Wasi {
         // Get the wasi version in non-strict mode, so no other imports
         // are allowed
         get_wasi_versions(module, false).is_some()
+    }
+
+    pub(crate) fn all_volumes(&self) -> Vec<MappedDirectory> {
+        self.volumes
+            .iter()
+            .cloned()
+            .chain(self.pre_opened_directories.iter().map(|d| MappedDirectory {
+                host: d.clone(),
+                guest: d.to_str().expect("must be a valid path string").to_string(),
+            }))
+            .chain(self.mapped_dirs.iter().cloned())
+            .collect_vec()
     }
 
     pub fn prepare(
@@ -307,108 +346,33 @@ impl Wasi {
             .map_commands(map_commands);
 
         let mut builder = {
-            // If we preopen anything from the host then shallow copy it over
-            let root_fs = RootFileSystemBuilder::new()
+            let mount_fs = RootFileSystemBuilder::new()
                 .with_tty(Box::new(DeviceFile::new(__WASI_STDIN_FILENO)))
                 .build();
+            let (have_current_dir, mapped_dirs) = self.build_mapped_directories(false)?;
+            let mut root_layers: Vec<Arc<dyn FileSystem + Send + Sync>> = Vec::new();
 
-            let mut mapped_dirs = Vec::new();
-
-            // Process the --dirs flag and merge it with --mapdir.
-            let mut have_current_dir = false;
-            for dir in &self.pre_opened_directories {
-                let mapping = if dir == Path::new(".") {
-                    if have_current_dir {
-                        bail!(
-                            "Cannot pre-open the current directory twice: --dir=. must only be specified once"
-                        );
-                    }
-                    have_current_dir = true;
-
-                    let current_dir =
-                        std::env::current_dir().context("could not determine current directory")?;
-
-                    MappedDirectory {
-                        host: current_dir,
-                        guest: MAPPED_CURRENT_DIR_DEFAULT_PATH.to_string(),
-                    }
+            for mapped in mapped_dirs {
+                let MountedDirectory { guest, fs } = MountedDirectory::from(mapped);
+                if guest == "/" {
+                    root_layers.push(fs);
                 } else {
-                    let resolved = dir.canonicalize().with_context(|| {
-                        format!(
-                            "could not canonicalize path for argument '--dir {}'",
-                            dir.display()
-                        )
-                    })?;
-
-                    if &resolved != dir {
-                        bail!(
-                            "Invalid argument '--dir {}': path must either be absolute, or '.'",
-                            dir.display(),
-                        );
-                    }
-
-                    let guest = resolved
-                        .to_str()
-                        .with_context(|| {
-                            format!(
-                                "invalid argument '--dir {}': path must be valid utf-8",
-                                dir.display(),
-                            )
-                        })?
-                        .to_string();
-
-                    MappedDirectory {
-                        host: resolved,
-                        guest,
-                    }
-                };
-
-                mapped_dirs.push(mapping);
-            }
-
-            for MappedDirectory { host, guest } in &self.mapped_dirs {
-                let resolved_host = host.canonicalize().with_context(|| {
-                    format!(
-                        "could not canonicalize path for argument '--mapdir {}:{}'",
-                        host.display(),
-                        guest,
-                    )
-                })?;
-
-                let mapping = if guest == "." {
-                    if have_current_dir {
-                        bail!(
-                            "Cannot pre-open the current directory twice: '--mapdir=?:.' / '--dir=.' must only be specified once"
-                        );
-                    }
-                    have_current_dir = true;
-
-                    MappedDirectory {
-                        host: resolved_host,
-                        guest: MAPPED_CURRENT_DIR_DEFAULT_PATH.to_string(),
-                    }
-                } else {
-                    MappedDirectory {
-                        host: resolved_host,
-                        guest: guest.clone(),
-                    }
-                };
-                mapped_dirs.push(mapping);
-            }
-
-            if !mapped_dirs.is_empty() {
-                // TODO: should we expose the common ancestor instead of root?
-                let fs_backing: Arc<dyn FileSystem + Send + Sync> =
-                    Arc::new(PassthruFileSystem::new(default_fs_backing()));
-                for MappedDirectory { host, guest } in self.mapped_dirs.clone() {
-                    let host = if !host.is_absolute() {
-                        Path::new("/").join(host)
-                    } else {
-                        host
-                    };
-                    root_fs.mount(guest.into(), &fs_backing, host)?;
+                    mount_fs.mount(&guest, Arc::new(fs))?;
                 }
             }
+
+            if !root_layers.is_empty() {
+                let existing_root = mount_fs
+                    .filesystem_at(Path::new("/"))
+                    .expect("root fs builder should always mount /");
+                mount_fs.set_mount(
+                    Path::new("/"),
+                    Arc::new(OverlayFileSystem::new(
+                        ArcFileSystem::new(existing_root),
+                        root_layers,
+                    )),
+                )?;
+            };
 
             if let Some(cwd) = self.cwd.as_ref() {
                 if !cwd.starts_with("/") {
@@ -419,15 +383,25 @@ impl Wasi {
 
             // Open the root of the new filesystem
             builder = builder
-                .sandbox_fs(root_fs)
+                .mount_fs(mount_fs)
                 .preopen_dir(Path::new("/"))
                 .unwrap();
 
-            if have_current_dir {
-                builder.map_dir(".", MAPPED_CURRENT_DIR_DEFAULT_PATH)?
+            let dot_path = if have_current_dir {
+                PathBuf::from(MAPPED_CURRENT_DIR_DEFAULT_PATH)
             } else {
-                builder.map_dir(".", "/")?
-            }
+                PathBuf::from("/")
+            };
+
+            builder.add_preopen_build(|p| {
+                p.directory(&dot_path)
+                    .alias(".")
+                    .read(true)
+                    .write(true)
+                    .create(true)
+            })?;
+
+            builder
         };
 
         *builder.capabilities_mut() = self.capabilities();
@@ -495,81 +469,51 @@ impl Wasi {
         Ok(Vec::new())
     }
 
-    pub fn build_mapped_directories(&self) -> Result<(bool, Vec<MappedDirectory>), anyhow::Error> {
+    pub fn build_mapped_directories(
+        &self,
+        is_wasix: bool,
+    ) -> Result<(bool, Vec<MappedDirectory>), anyhow::Error> {
         let mut mapped_dirs = Vec::new();
 
-        // Process the --dirs flag and merge it with --mapdir.
+        // Process the --volume flag.
         let mut have_current_dir = false;
-        for dir in &self.pre_opened_directories {
-            let mapping = if dir == Path::new(".") {
-                if have_current_dir {
-                    bail!(
-                        "Cannot pre-open the current directory twice: --dir=. must only be specified once"
-                    );
-                }
-                have_current_dir = true;
-
-                let current_dir =
-                    std::env::current_dir().context("could not determine current directory")?;
-
-                MappedDirectory {
-                    host: current_dir,
-                    guest: MAPPED_CURRENT_DIR_DEFAULT_PATH.to_string(),
-                }
-            } else {
-                let resolved = dir.canonicalize().with_context(|| {
-                    format!(
-                        "could not canonicalize path for argument '--dir {}'",
-                        dir.display()
-                    )
-                })?;
-
-                if &resolved != dir {
-                    bail!(
-                        "Invalid argument '--dir {}': path must either be absolute, or '.'",
-                        dir.display(),
-                    );
-                }
-
-                let guest = resolved
-                    .to_str()
-                    .with_context(|| {
-                        format!(
-                            "invalid argument '--dir {}': path must be valid utf-8",
-                            dir.display(),
-                        )
-                    })?
-                    .to_string();
-
-                MappedDirectory {
-                    host: resolved,
-                    guest,
-                }
-            };
-
-            mapped_dirs.push(mapping);
-        }
-
-        for MappedDirectory { host, guest } in &self.mapped_dirs {
+        for MappedDirectory { host, guest } in &self.all_volumes() {
             let resolved_host = host.canonicalize().with_context(|| {
                 format!(
-                    "could not canonicalize path for argument '--mapdir {}:{}'",
+                    "could not canonicalize path for argument '--volume {}:{}'",
                     host.display(),
                     guest,
                 )
             })?;
 
+            if guest == "/" && is_wasix {
+                // Note: it appears we canonicalize the path before this point and showing the value of
+                // `host` in the error message may throw users off, so we use a placeholder.
+                tracing::warn!(
+                    "Mounting on the guest's virtual root with --volume <HOST_DIR>:/ breaks WASIX modules' filesystems"
+                );
+            }
+
             let mapping = if guest == "." {
                 if have_current_dir {
                     bail!(
-                        "Cannot pre-open the current directory twice: '--mapdir=?:.' / '--dir=.' must only be specified once"
+                        "Cannot pre-open the current directory twice: '--volume=.' must only be specified once"
                     );
                 }
                 have_current_dir = true;
 
+                let host = if host == Path::new(".") {
+                    std::env::current_dir().context("could not determine current directory")?
+                } else {
+                    host.clone()
+                };
                 MappedDirectory {
                     host: resolved_host,
-                    guest: MAPPED_CURRENT_DIR_DEFAULT_PATH.to_string(),
+                    guest: if is_wasix {
+                        MAPPED_CURRENT_DIR_DEFAULT_PATH.to_string()
+                    } else {
+                        "/".to_string()
+                    },
                 }
             } else {
                 MappedDirectory {
@@ -619,7 +563,9 @@ impl Wasi {
             caps.http_client = wasmer_wasix::http::HttpClientCapabilityV1::new_allow_all();
         }
 
-        caps.threading.enable_asynchronous_threading = self.enable_async_threads;
+        if let Some(enable_async_threads) = self.enable_async_threads {
+            caps.threading.enable_asynchronous_threading = enable_async_threads;
+        }
         caps.threading.enable_exponential_cpu_backoff =
             self.enable_cpu_backoff.map(Duration::from_millis);
 
@@ -633,6 +579,7 @@ impl Wasi {
         pkg_cache_path: &Path,
         rt_or_handle: I,
         preferred_webc_version: webc::Version,
+        compiler_debug_dir_used: bool,
     ) -> Result<impl Runtime + Send + Sync + use<I>>
     where
         I: Into<RuntimeOrHandle>,
@@ -696,7 +643,7 @@ impl Wasi {
 
         let registry = self.prepare_source(env, client, preferred_webc_version)?;
 
-        if !self.disable_cache {
+        if !self.disable_cache && !compiler_debug_dir_used {
             let cache_dir = env.cache_dir().join("compiled");
             let module_cache = wasmer_wasix::runtime::module_cache::in_memory()
                 .with_fallback(FileSystemCache::new(cache_dir, tokio_task_manager));
@@ -733,7 +680,13 @@ impl Wasi {
         Ok(Self {
             deny_multiple_wasi_versions: true,
             env_vars: std::env::vars().collect(),
-            pre_opened_directories: vec![dir],
+            volumes: vec![MappedDirectory {
+                host: dir.clone(),
+                guest: dir
+                    .to_str()
+                    .expect("dir must be a valid string")
+                    .to_string(),
+            }],
             ..Self::default()
         })
     }
@@ -773,7 +726,10 @@ impl Wasi {
         source.add_source(preloaded);
 
         let graphql_endpoint = self.graphql_endpoint(env)?;
-        let cache_dir = env.cache_dir().join("queries");
+        let cache_dir = env
+            .cache_dir()
+            .join("queries")
+            .join(endpoint_to_folder(&graphql_endpoint));
         let mut wapm_source = BackendSource::new(graphql_endpoint, Arc::clone(&client))
             .with_local_cache(cache_dir, WAPM_SOURCE_CACHE_TIMEOUT)
             .with_preferred_webc_version(preferred_webc_version);

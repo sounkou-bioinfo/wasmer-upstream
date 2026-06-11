@@ -7,6 +7,7 @@ mod target;
 mod wasi;
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, hash_map::DefaultHasher},
     fmt::{Binary, Display},
     fs::File,
@@ -21,6 +22,7 @@ use std::{
 
 use anyhow::{Context, Error, anyhow, bail};
 use clap::{Parser, ValueEnum};
+use colored::Colorize;
 use futures::future::BoxFuture;
 use indicatif::{MultiProgress, ProgressBar};
 use once_cell::sync::Lazy;
@@ -30,7 +32,7 @@ use url::Url;
 use wasmer::sys::NativeEngineExt;
 use wasmer::{
     AsStoreMut, DeserializeError, Engine, Function, Imports, Instance, Module, RuntimeError, Store,
-    Type, TypedFunction, Value,
+    Type, TypedFunction, Value, wat2wasm,
 };
 
 use wasmer_types::{Features, target::Target};
@@ -49,12 +51,10 @@ use wasmer_wasix::{
     journal::CompactingLogFileJournal,
     runners::{
         MappedCommand, MappedDirectory, Runner,
-        dcgi::{DcgiInstanceFactory, DcgiRunner},
-        dproxy::DProxyRunner,
         wasi::{RuntimeOrEngine, WasiRunner},
-        wcgi::{self, AbortHandle, NoOpWcgiCallbacks, WcgiRunner},
     },
     runtime::{
+        OverriddenRuntime,
         module_cache::{CacheError, HashedModuleData},
         package_loader::PackageLoader,
         resolver::QueryError,
@@ -65,8 +65,11 @@ use webc::Container;
 use webc::metadata::Manifest;
 
 use crate::{
-    backend::RuntimeOptions, commands::run::wasi::Wasi, common::HashAlgorithm, config::WasmerEnv,
-    error::PrettyError, logging::Output,
+    backend::RuntimeOptions,
+    commands::run::{target::TargetOnDisk, wasi::Wasi},
+    config::WasmerEnv,
+    error::PrettyError,
+    logging::Output,
 };
 
 use self::{
@@ -84,8 +87,6 @@ pub struct Run {
     rt: RuntimeOptions,
     #[clap(flatten)]
     wasi: crate::commands::run::Wasi,
-    #[clap(flatten)]
-    wcgi: WcgiOptions,
     /// Set the default stack size (default is 1048576)
     #[clap(long = "stack-size")]
     stack_size: Option<usize>,
@@ -98,17 +99,74 @@ pub struct Run {
     /// Generate a coredump at this path if a WebAssembly trap occurs
     #[clap(name = "COREDUMP_PATH", long)]
     coredump_on_trap: Option<PathBuf>,
+    /// Enable experimental N-API imports for modules that require them
+    #[clap(long = "experimental-napi")]
+    experimental_napi: bool,
     /// The file, URL, or package to run.
     #[clap(value_parser = CliPackageSource::infer)]
     input: CliPackageSource,
     /// Command-line arguments passed to the package
     args: Vec<String>,
-    /// Hashing algorithm to be used for module hash
-    #[clap(long, value_enum)]
-    hash_algorithm: Option<HashAlgorithm>,
 }
 
 impl Run {
+    #[cfg(feature = "napi-v8")]
+    fn module_needs_napi(module: &Module) -> bool {
+        let (napi_version, napi_extension_version) = wasmer_napi::module_needs_napi(module);
+        napi_version.is_some() || napi_extension_version.is_some()
+    }
+
+    #[cfg(feature = "napi-v8")]
+    fn maybe_wrap_runtime_with_napi(
+        &self,
+        module: &Module,
+        runtime: Arc<dyn Runtime + Send + Sync>,
+    ) -> Result<Arc<dyn Runtime + Send + Sync>, Error> {
+        use anyhow::ensure;
+
+        if !Self::module_needs_napi(module) {
+            return Ok(runtime);
+        }
+        ensure!(
+            self.experimental_napi,
+            "This module imports N-API. Re-run with '--experimental-napi' to enable the experimental N-API runtime."
+        );
+
+        let hooks = wasmer_napi::NapiCtx::default().runtime_hooks();
+        Ok(Arc::new(
+            OverriddenRuntime::new(runtime)
+                .with_additional_imports({
+                    let hooks = hooks.clone();
+                    move |module, store| hooks.additional_imports(module, store)
+                })
+                .with_instance_setup(move |module, store, instance, imported_memory| {
+                    hooks.configure_instance(module, store, instance, imported_memory)
+                }),
+        ))
+    }
+
+    #[cfg(feature = "napi-v8")]
+    fn configure_wasi_runner_for_napi(&self, module: &Module, runner: &mut WasiRunner) {
+        if Self::module_needs_napi(module) {
+            runner
+                .capabilities_mut()
+                .threading
+                .enable_asynchronous_threading = false;
+        }
+    }
+
+    #[cfg(not(feature = "napi-v8"))]
+    fn maybe_wrap_runtime_with_napi(
+        &self,
+        _module: &Module,
+        runtime: Arc<dyn Runtime + Send + Sync>,
+    ) -> Result<Arc<dyn Runtime + Send + Sync>, Error> {
+        Ok(runtime)
+    }
+
+    #[cfg(not(feature = "napi-v8"))]
+    fn configure_wasi_runner_for_napi(&self, _module: &Module, _runner: &mut WasiRunner) {}
+
     pub fn execute(self, output: Output) -> ! {
         let result = self.execute_inner(output);
         exit_with_wasi_exit_code(result);
@@ -116,6 +174,8 @@ impl Run {
 
     #[tracing::instrument(level = "debug", name = "wasmer_run", skip_all)]
     fn execute_inner(mut self, output: Output) -> Result<(), Error> {
+        self.print_option_warnings();
+
         let pb = ProgressBar::new_spinner();
         pb.set_draw_target(output.draw_target());
         pb.enable_steady_tick(TICK);
@@ -149,34 +209,39 @@ impl Run {
             tracing::info!("Input file path: {}", path.display());
 
             // Try to read and detect any file that exists, regardless of extension
-            if path.exists() {
-                tracing::info!("Found file: {}", path.display());
-                match std::fs::read(path) {
-                    Ok(bytes) => {
-                        tracing::info!("Read {} bytes from file", bytes.len());
-
-                        // Check if it's a WebAssembly module by looking for magic bytes
-                        let magic = [0x00, 0x61, 0x73, 0x6D]; // "\0asm"
-                        if bytes.len() >= 4 && bytes[0..4] == magic {
-                            // Looks like a valid WebAssembly module, save the bytes for feature detection
-                            tracing::info!(
-                                "Valid WebAssembly module detected, magic header verified"
-                            );
-                            wasm_bytes = Some(bytes);
+            let target = TargetOnDisk::from_file(path);
+            if let Ok(target) = target {
+                match target {
+                    TargetOnDisk::WebAssemblyBinary => {
+                        if let Ok(data) = std::fs::read(path) {
+                            wasm_bytes = Some(data);
                         } else {
-                            tracing::info!(
-                                "File does not have valid WebAssembly magic number, will try to run it anyway"
-                            );
-                            // Still provide the bytes so the engine can attempt to run it
-                            wasm_bytes = Some(bytes);
+                            tracing::info!("Failed to read file: {}", path.display());
                         }
                     }
-                    Err(e) => {
-                        tracing::info!("Failed to read file for feature detection: {}", e);
-                    }
+                    TargetOnDisk::Wat => match std::fs::read(path) {
+                        Ok(data) => match wat2wasm(&data) {
+                            Ok(wasm) => {
+                                wasm_bytes = Some(wasm.to_vec());
+                            }
+                            Err(e) => {
+                                tracing::info!(
+                                    "Failed to convert WAT to Wasm for {}: {e}",
+                                    path.display()
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            tracing::info!("Failed to read WAT file {}: {e}", path.display());
+                        }
+                    },
+                    _ => {}
                 }
             } else {
-                tracing::info!("File does not exist: {}", path.display());
+                tracing::info!(
+                    "Failed to read file for feature detection: {}",
+                    path.display()
+                );
             }
         } else {
             tracing::info!("Input is not a file, skipping WebAssembly feature detection");
@@ -206,12 +271,10 @@ impl Run {
         tracing::info!("Executing on backend {engine_kind:?}");
 
         #[cfg(feature = "sys")]
-        if engine.is_sys() {
-            if self.stack_size.is_some() {
-                wasmer_vm::set_stack_size(self.stack_size.unwrap());
-            }
-            let hash_algorithm = self.hash_algorithm.unwrap_or_default().into();
-            engine.set_hash_algorithm(Some(hash_algorithm));
+        if engine.is_sys()
+            && let Some(stack_size) = self.stack_size
+        {
+            wasmer_vm::set_stack_size(stack_size);
         }
 
         let engine = engine.clone();
@@ -222,6 +285,7 @@ impl Run {
             &capabilities::get_capability_cache_path(&self.env, &self.input)?,
             runtime,
             preferred_webc_version,
+            self.rt.compiler_debug_dir.is_some(),
         )?;
 
         // This is a slow operation, so let's temporarily wrap the runtime with
@@ -238,7 +302,7 @@ impl Run {
 
         if let ExecutableTarget::Package(ref pkg) = target {
             self.wasi
-                .mapped_dirs
+                .volumes
                 .extend(pkg.additional_host_mapped_directories.clone());
         }
 
@@ -273,15 +337,12 @@ impl Run {
                             &Target::default(),
                         );
 
-                        if !filtered_backends.is_empty() {
-                            let engine_id = filtered_backends[0].to_string();
+                        if let Some(backend) = filtered_backends.first() {
+                            let engine_id = backend.to_string();
 
                             // Get a new engine that's compatible with the required features
-                            if let Ok(new_engine) = filtered_backends[0].get_engine(
-                                &Target::default(),
-                                &features,
-                                &self.rt,
-                            ) {
+                            if let Ok(new_engine) = backend.get_engine(&Target::default(), &self.rt)
+                            {
                                 tracing::info!(
                                     "The command '{}' requires to run the Wasm module with the features {:?}. The backends available are {}. Choosing {}.",
                                     cmd.name(),
@@ -303,6 +364,7 @@ impl Run {
                                         .enable_all()
                                         .build()?,
                                     preferred_webc_version,
+                                    self.rt.compiler_debug_dir.is_some(),
                                 )?;
 
                                 let new_runtime = Arc::new(MonitoringRuntime::new(
@@ -314,7 +376,7 @@ impl Run {
                             }
                         }
                     }
-                    self.execute_webc(&pkg, runtime.clone())
+                    self.execute_webc(&pkg, monitoring_runtime)
                 }
             }
         };
@@ -364,13 +426,7 @@ impl Run {
 
         let uses = self.load_injected_packages(&runtime)?;
 
-        if DcgiRunner::can_run_command(cmd.metadata())? {
-            self.run_dcgi(id, pkg, uses, runtime)
-        } else if DProxyRunner::can_run_command(cmd.metadata())? {
-            self.run_dproxy(id, pkg, runtime)
-        } else if WcgiRunner::can_run_command(cmd.metadata())? {
-            self.run_wcgi(id, pkg, uses, runtime)
-        } else if WasiRunner::can_run_command(cmd.metadata())? {
+        if WasiRunner::can_run_command(cmd.metadata())? {
             self.run_wasi(id, pkg, uses, runtime)
         } else {
             bail!(
@@ -414,92 +470,25 @@ impl Run {
         uses: Vec<BinaryPackage>,
         runtime: Arc<dyn Runtime + Send + Sync>,
     ) -> Result<(), Error> {
-        let mut runner = self.build_wasi_runner(&runtime)?;
+        #[cfg(feature = "napi-v8")]
+        let (module, runtime) = {
+            let cmd = pkg.get_command(command_name).with_context(|| {
+                format!("Unable to get metadata for the \"{command_name}\" command")
+            })?;
+            let module = runtime.resolve_module_sync(
+                wasmer_wasix::runtime::ModuleInput::Command(Cow::Borrowed(cmd)),
+                None,
+                None,
+            )?;
+            let runtime = self.maybe_wrap_runtime_with_napi(&module, runtime)?;
+            (module, runtime)
+        };
+
+        // Assume webcs are always WASIX
+        let mut runner = self.build_wasi_runner(&runtime, true)?;
+        #[cfg(feature = "napi-v8")]
+        self.configure_wasi_runner_for_napi(&module, &mut runner);
         Runner::run_command(&mut runner, command_name, pkg, runtime)
-    }
-
-    fn run_wcgi(
-        &self,
-        command_name: &str,
-        pkg: &BinaryPackage,
-        uses: Vec<BinaryPackage>,
-        runtime: Arc<dyn Runtime + Send + Sync>,
-    ) -> Result<(), Error> {
-        let mut runner = wasmer_wasix::runners::wcgi::WcgiRunner::new(NoOpWcgiCallbacks);
-        self.config_wcgi(runner.config(), uses)?;
-        runner.run_command(command_name, pkg, runtime)
-    }
-
-    fn config_wcgi(
-        &self,
-        config: &mut wcgi::Config,
-        uses: Vec<BinaryPackage>,
-    ) -> Result<(), Error> {
-        config
-            .args(self.args.clone())
-            .addr(self.wcgi.addr)
-            .envs(self.wasi.env_vars.clone())
-            .map_directories(self.wasi.mapped_dirs.clone())
-            .callbacks(Callbacks::new(self.wcgi.addr))
-            .inject_packages(uses);
-        *config.capabilities() = self.wasi.capabilities();
-        if self.wasi.forward_host_env {
-            config.forward_host_env();
-        }
-
-        #[cfg(feature = "journal")]
-        {
-            for trigger in self.wasi.snapshot_on.iter().cloned() {
-                config.add_snapshot_trigger(trigger);
-            }
-            if self.wasi.snapshot_on.is_empty() && !self.wasi.writable_journals.is_empty() {
-                config.add_default_snapshot_triggers();
-            }
-            if let Some(period) = self.wasi.snapshot_interval {
-                if self.wasi.writable_journals.is_empty() {
-                    return Err(anyhow::format_err!(
-                        "If you specify a snapshot interval then you must also specify a writable journal file"
-                    ));
-                }
-                config.with_snapshot_interval(Duration::from_millis(period));
-            }
-            if self.wasi.stop_after_snapshot {
-                config.with_stop_running_after_snapshot(true);
-            }
-            let (r, w) = self.wasi.build_journals()?;
-            for journal in r {
-                config.add_read_only_journal(journal);
-            }
-            for journal in w {
-                config.add_writable_journal(journal);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn run_dcgi(
-        &self,
-        command_name: &str,
-        pkg: &BinaryPackage,
-        uses: Vec<BinaryPackage>,
-        runtime: Arc<dyn Runtime + Send + Sync>,
-    ) -> Result<(), Error> {
-        let factory = DcgiInstanceFactory::new();
-        let mut runner = wasmer_wasix::runners::dcgi::DcgiRunner::new(factory);
-        self.config_wcgi(runner.config().inner(), uses);
-        runner.run_command(command_name, pkg, runtime)
-    }
-
-    fn run_dproxy(
-        &self,
-        command_name: &str,
-        pkg: &BinaryPackage,
-        runtime: Arc<dyn Runtime + Send + Sync>,
-    ) -> Result<(), Error> {
-        let mut inner = self.build_wasi_runner(&runtime)?;
-        let mut runner = wasmer_wasix::runners::dproxy::DProxyRunner::new(inner, pkg);
-        runner.run_command(command_name, pkg, runtime)
     }
 
     #[tracing::instrument(skip_all)]
@@ -546,19 +535,20 @@ impl Run {
     fn build_wasi_runner(
         &self,
         runtime: &Arc<dyn Runtime + Send + Sync>,
+        is_wasix: bool,
     ) -> Result<WasiRunner, anyhow::Error> {
         let packages = self.load_injected_packages(runtime)?;
 
         let mut runner = WasiRunner::new();
 
-        let (is_home_mapped, mapped_diretories) = self.wasi.build_mapped_directories()?;
+        let (is_home_mapped, mapped_directories) = self.wasi.build_mapped_directories(is_wasix)?;
 
         runner
             .with_args(&self.args)
             .with_injected_packages(packages)
             .with_envs(self.wasi.env_vars.clone())
             .with_mapped_host_commands(self.wasi.build_mapped_commands()?)
-            .with_mapped_directories(mapped_diretories)
+            .with_mapped_directories(mapped_directories)
             .with_home_mapped(is_home_mapped)
             .with_forward_host_env(self.wasi.forward_host_env)
             .with_capabilities(self.wasi.capabilities());
@@ -615,8 +605,11 @@ impl Run {
         runtime: Arc<dyn Runtime + Send + Sync>,
     ) -> Result<(), Error> {
         let program_name = wasm_path.display().to_string();
+        let runtime = self.maybe_wrap_runtime_with_napi(&module, runtime)?;
 
-        let runner = self.build_wasi_runner(&runtime)?;
+        let mut runner =
+            self.build_wasi_runner(&runtime, wasmer_wasix::is_wasix_module(&module))?;
+        self.configure_wasi_runner_for_napi(&module, &mut runner);
         runner.run_wasm(
             RuntimeOrEngine::Runtime(runtime),
             &program_name,
@@ -628,14 +621,33 @@ impl Run {
     #[allow(unused_variables)]
     fn maybe_save_coredump(&self, e: &Error) {
         #[cfg(feature = "coredump")]
-        if let Some(coredump) = &self.coredump_on_trap {
-            if let Err(e) = generate_coredump(e, self.input.to_string(), coredump) {
-                tracing::warn!(
-                    error = &*e as &dyn std::error::Error,
-                    coredump_path=%coredump.display(),
-                    "Unable to generate a coredump",
-                );
-            }
+        if let Some(coredump) = &self.coredump_on_trap
+            && let Err(e) = generate_coredump(e, self.input.to_string(), coredump)
+        {
+            tracing::warn!(
+                error = &*e as &dyn std::error::Error,
+                coredump_path=%coredump.display(),
+                "Unable to generate a coredump",
+            );
+        }
+    }
+
+    fn print_option_warnings(&self) {
+        if !self.wasi.mapped_dirs.is_empty() {
+            eprintln!(
+                "{}The `{}` option is deprecated and will be removed in the next major release. Please use `{}` instead.",
+                "warning: ".yellow(),
+                "--mapdir".yellow(),
+                "--volume".green()
+            );
+        }
+        if !self.wasi.pre_opened_directories.is_empty() {
+            eprintln!(
+                "{}The `{}` option is deprecated and will be removed in the next major release. Please use `{}` instead.",
+                "warning: ".yellow(),
+                "--dir".yellow(),
+                "--volume".green()
+            );
         }
     }
 }
@@ -717,52 +729,6 @@ fn generate_coredump(err: &Error, source_name: String, coredump_path: &Path) -> 
     })?;
 
     Ok(())
-}
-
-#[derive(Debug, Clone, Parser)]
-pub(crate) struct WcgiOptions {
-    /// The address to serve on.
-    #[clap(long, short, env, default_value_t = ([127, 0, 0, 1], 8000).into())]
-    pub(crate) addr: SocketAddr,
-}
-
-impl Default for WcgiOptions {
-    fn default() -> Self {
-        Self {
-            addr: ([127, 0, 0, 1], 8000).into(),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Callbacks {
-    stderr: Mutex<LineWriter<std::io::Stderr>>,
-    addr: SocketAddr,
-}
-
-impl Callbacks {
-    fn new(addr: SocketAddr) -> Self {
-        Callbacks {
-            stderr: Mutex::new(LineWriter::new(std::io::stderr())),
-            addr,
-        }
-    }
-}
-
-impl wasmer_wasix::runners::wcgi::Callbacks for Callbacks {
-    fn started(&self, _abort: AbortHandle) {
-        println!("WCGI Server running at http://{}/", self.addr);
-    }
-
-    fn on_stderr(&self, raw_message: &[u8]) {
-        if let Ok(mut stderr) = self.stderr.lock() {
-            // If the WCGI runner printed any log messages we want to make sure
-            // they get propagated to the user. Line buffering is important here
-            // because it helps prevent the output from becoming a complete
-            // mess.
-            let _ = stderr.write_all(raw_message);
-        }
-    }
 }
 
 /// Exit the current process, using the WASI exit code if the error contains

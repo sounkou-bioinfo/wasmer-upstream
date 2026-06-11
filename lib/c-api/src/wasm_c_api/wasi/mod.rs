@@ -198,9 +198,7 @@ pub unsafe extern "C" fn wasi_filesystem_init_static_memory(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wasi_filesystem_delete(ptr: *mut wasi_filesystem_t) {
-    let _ = unsafe { Box::from_raw(ptr) };
-}
+pub unsafe extern "C" fn wasi_filesystem_delete(_ptr: Option<Box<wasi_filesystem_t>>) {}
 
 /// Initializes the `imports` with an import object that links to
 /// the custom file system
@@ -232,6 +230,7 @@ unsafe fn wasi_env_with_filesystem_inner(
     let package = package_str.to_str().unwrap_or("");
     let module = &module.as_ref()?.inner;
     let imports = imports?;
+    #[allow(clippy::unnecessary_cast)]
     let fs_bytes = unsafe { &*(fs.ptr as *const u8) };
 
     let (wasi_env, import_object) = {
@@ -264,6 +263,7 @@ fn prepare_webc_env(
     package_name: &str,
 ) -> Option<(WasiFunctionEnv, Imports)> {
     use virtual_fs::static_fs::StaticFileSystem;
+    use wasmer_wasix::virtual_fs::FileSystem;
     use webc::v1::{FsEntryType, WebC};
 
     let store_mut = store.as_store_mut();
@@ -291,14 +291,14 @@ fn prepare_webc_env(
                 .top_level
                 .iter()
                 .filter(|entry| entry.fs_type == FsEntryType::Dir)
-                .cloned()
                 .map(|e| e.text.to_string())
                 .collect::<Vec<_>>()
                 .into_iter()
         })
         .collect::<Vec<_>>();
 
-    let filesystem = Box::new(StaticFileSystem::init(slice, package_name)?);
+    let filesystem =
+        Arc::new(StaticFileSystem::init(slice, package_name)?) as Arc<dyn FileSystem + Send + Sync>;
     let mut builder = config.builder.runtime(Arc::new(rt));
 
     if !config.inherit_stdout {
@@ -388,7 +388,7 @@ pub extern "C" fn wasi_env_delete(state: Option<Box<wasi_env_t>>) {
 
 /// Set the memory on a [`wasi_env_t`].
 // NOTE: Only here to not break the C API.
-// This was previosly supported, but is no longer possible due to WASIX changes.
+// This was previously supported, but is no longer possible due to WASIX changes.
 // Customizing memories should be done through the builder or the runtime.
 #[unsafe(no_mangle)]
 #[deprecated(since = "4.0.0")]
@@ -575,7 +575,7 @@ unsafe fn wasi_get_imports_inner(
     };
     let memory = {
         let mut store_mut = unsafe { store.store_mut() };
-        tasks.build_memory(&mut store_mut, &spawn_type).unwrap()
+        tasks.build_memory(&mut store_mut, spawn_type).unwrap()
     };
 
     if let Some(memory) = memory {

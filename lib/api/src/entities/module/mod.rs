@@ -11,8 +11,8 @@ use thiserror::Error;
 #[cfg(feature = "wat")]
 use wasmer_types::WasmError;
 use wasmer_types::{
-    CompileError, DeserializeError, ExportType, ExportsIterator, ImportType, ImportsIterator,
-    ModuleInfo, SerializeError,
+    CompilationProgress, CompilationProgressCallback, CompileError, DeserializeError, ExportType,
+    ExportsIterator, ImportType, ImportsIterator, ModuleInfo, SerializeError, UserAbort,
 };
 
 use crate::{AsEngineRef, macros::backend::match_rt, utils::IntoBytes};
@@ -57,7 +57,7 @@ impl Module {
     /// ## Errors
     ///
     /// Creating a WebAssembly module from bytecode can result in a
-    /// [`CompileError`] since this operation requires to transorm the Wasm
+    /// [`CompileError`] since this operation requires to transform the Wasm
     /// bytecode into code the machine can easily execute.
     ///
     /// ## Example
@@ -276,8 +276,8 @@ impl Module {
     ///
     /// ```ignore
     /// # use wasmer::*;
-    /// # let mut store = Store::default();
     /// # fn main() -> anyhow::Result<()> {
+    /// # let mut store = Store::default();
     /// let module = Module::deserialize_from_file(&store, path)?;
     /// # Ok(())
     /// # }
@@ -306,8 +306,8 @@ impl Module {
     ///
     /// ```ignore
     /// # use wasmer::*;
-    /// # let mut store = Store::default();
     /// # fn main() -> anyhow::Result<()> {
+    /// # let mut store = Store::default();
     /// let module = Module::deserialize_from_file_unchecked(&store, path)?;
     /// # Ok(())
     /// # }

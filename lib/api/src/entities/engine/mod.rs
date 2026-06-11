@@ -95,25 +95,10 @@ impl Engine {
                 // Get V8-specific features
                 crate::backend::v8::engine::Engine::default_features()
             }
-            #[cfg(feature = "wamr")]
-            crate::BackendKind::Wamr => {
-                // Get WAMR-specific features
-                crate::backend::wamr::engine::Engine::default_features()
-            }
-            #[cfg(feature = "wasmi")]
-            crate::BackendKind::Wasmi => {
-                // Get WASMI-specific features
-                crate::backend::wasmi::engine::Engine::default_features()
-            }
             #[cfg(feature = "js")]
             crate::BackendKind::Js => {
                 // Get JS-specific features
                 crate::backend::js::engine::Engine::default_features()
-            }
-            #[cfg(feature = "jsc")]
-            crate::BackendKind::Jsc => {
-                // Get JSC-specific features
-                crate::backend::jsc::engine::Engine::default_features()
             }
             // Default case
             _ => Features::default(),
@@ -143,25 +128,10 @@ impl Engine {
                 // Get V8-specific features
                 crate::backend::v8::engine::Engine::supported_features()
             }
-            #[cfg(feature = "wamr")]
-            crate::BackendKind::Wamr => {
-                // Get WAMR-specific features
-                crate::backend::wamr::engine::Engine::supported_features()
-            }
-            #[cfg(feature = "wasmi")]
-            crate::BackendKind::Wasmi => {
-                // Get WASMI-specific features
-                crate::backend::wasmi::engine::Engine::supported_features()
-            }
             #[cfg(feature = "js")]
             crate::BackendKind::Js => {
                 // Get JS-specific features
                 crate::backend::js::engine::Engine::supported_features()
-            }
-            #[cfg(feature = "jsc")]
-            crate::BackendKind::Jsc => {
-                // Get JSC-specific features
-                crate::backend::jsc::engine::Engine::supported_features()
             }
             // Default case
             _ => Features::default(),
@@ -253,6 +223,16 @@ impl Engine {
             #[cfg(feature = "sys")]
             BackendEngine::Sys(ref mut e) => e.with_opts(suggested_opts),
             _ => Ok(()),
+        }
+    }
+
+    #[cfg(feature = "experimental-async")]
+    /// Returns true if the engine supports async operations.
+    pub fn supports_async(&self) -> bool {
+        match self.be {
+            #[cfg(feature = "sys")]
+            BackendEngine::Sys(ref e) => true,
+            _ => false,
         }
     }
 }

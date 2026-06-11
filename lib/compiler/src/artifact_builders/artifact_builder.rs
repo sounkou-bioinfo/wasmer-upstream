@@ -3,7 +3,8 @@
 
 #[cfg(feature = "compiler")]
 use super::trampoline::{libcall_trampoline_len, make_libcall_trampolines};
-
+#[cfg(feature = "compiler")]
+use crate::translator::analyze_readonly_funcref_table;
 use crate::{
     ArtifactCreate, Features,
     serialize::{
@@ -22,7 +23,7 @@ use crate::{
     EngineInner, ModuleEnvironment, ModuleMiddlewareChain, serialize::SerializableCompilation,
 };
 #[cfg(feature = "compiler")]
-use wasmer_types::target::Target;
+use wasmer_types::{CompilationProgressCallback, target::Target};
 
 use core::mem::MaybeUninit;
 use enumset::EnumSet;
@@ -63,7 +64,7 @@ impl ArtifactBuild {
         target: &Target,
         memory_styles: PrimaryMap<MemoryIndex, MemoryStyle>,
         table_styles: PrimaryMap<TableIndex, TableStyle>,
-        hash_algorithm: Option<HashAlgorithm>,
+        progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<Self, CompileError> {
         let environ = ModuleEnvironment::new();
         let features = inner_engine.features().clone();
@@ -78,16 +79,15 @@ impl ArtifactBuild {
         middlewares
             .apply_on_module_info(&mut module)
             .map_err(|err| CompileError::MiddlewareError(err.to_string()))?;
-
-        if let Some(hash_algorithm) = hash_algorithm {
-            let hash = match hash_algorithm {
-                HashAlgorithm::Sha256 => ModuleHash::sha256(data),
-                HashAlgorithm::XXHash => ModuleHash::xxhash(data),
-            };
-
-            module.hash = Some(hash);
+        #[cfg(feature = "translator")]
+        if compiler.enable_readonly_funcref_table()
+            && let Some(table_index) =
+                analyze_readonly_funcref_table(&module, &translation.function_body_inputs)?
+        {
+            module.tables[table_index].readonly = true;
         }
 
+        module.hash = Some(ModuleHash::new(data));
         let compile_info = CompileModuleInfo {
             module: Arc::new(module),
             features,
@@ -104,6 +104,7 @@ impl ArtifactBuild {
             // `module_translation_state`.
             translation.module_translation_state.as_ref().unwrap(),
             translation.function_body_inputs,
+            progress_callback,
         )?;
 
         let data_initializers = translation
@@ -267,7 +268,7 @@ impl<'a> ArtifactCreate<'a> for ArtifactBuild {
 pub struct ModuleFromArchive<'a> {
     /// The main serializable compilation object
     pub compilation: &'a ArchivedSerializableCompilation,
-    /// Datas initializers
+    /// Data initializers
     pub data_initializers: &'a rkyv::Archived<Box<[OwnedDataInitializer]>>,
     /// CPU Feature flags for this compilation
     pub cpu_features: u64,
@@ -314,7 +315,7 @@ impl loupe::MemoryUsage for ArtifactBuildFromArchiveCell {
 pub struct ArtifactBuildFromArchive {
     cell: Arc<ArtifactBuildFromArchiveCell>,
 
-    /// Compilation informations
+    /// Compilation information
     compile_info: CompileModuleInfo,
 }
 

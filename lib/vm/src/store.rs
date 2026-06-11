@@ -129,7 +129,7 @@ impl StoreObjects {
     }
 
     /// Set a global, at index idx. Will panic if idx is out of range
-    /// Safety: the caller should check taht the raw value is compatible
+    /// Safety: the caller should check that the raw value is compatible
     /// with destination VMGlobal type
     pub fn set_global_unchecked(&self, idx: usize, val: u128) {
         assert!(idx < self.globals.len());
@@ -241,7 +241,7 @@ pub struct InternalStoreHandle<T> {
 #[cfg(feature = "artifact-size")]
 impl<T> loupe::MemoryUsage for InternalStoreHandle<T> {
     fn size_of_val(&self, _tracker: &mut dyn loupe::MemoryUsageTracker) -> usize {
-        std::mem::size_of_val(&self)
+        std::mem::size_of_val(self)
     }
 }
 

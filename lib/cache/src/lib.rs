@@ -13,7 +13,7 @@
     clippy::unicode_not_nfc,
     clippy::use_self
 )]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod cache;
 mod filesystem;
@@ -24,5 +24,5 @@ pub use crate::cache::Cache;
 pub use crate::filesystem::FileSystemCache;
 pub use crate::hash::Hash;
 
-// We re-export those for convinience of users
+// We re-export those for convenience of users
 pub use wasmer::{DeserializeError, SerializeError};

@@ -1,5 +1,6 @@
 use crate::indexes::{FunctionIndex, GlobalIndex};
 use crate::lib::std::borrow::ToOwned;
+use crate::lib::std::boxed::Box;
 use crate::lib::std::fmt;
 use crate::lib::std::format;
 use crate::lib::std::string::{String, ToString};
@@ -119,8 +120,9 @@ impl From<&[u8]> for V128 {
 ///
 /// This list can be found in [`ImportType`] or [`ExportType`], so these types
 /// can either be imported or exported.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, RkyvSerialize, RkyvDeserialize, Archive)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[rkyv(derive(Debug))]
 pub enum ExternType {
     /// This external type is the type of a WebAssembly function.
     Function(FunctionType),
@@ -163,11 +165,13 @@ fn is_table_compatible(
         ty: exported_ty,
         minimum: exported_minimum,
         maximum: exported_maximum,
+        ..
     } = exported;
     let TableType {
         ty: imported_ty,
         minimum: imported_minimum,
         maximum: imported_maximum,
+        ..
     } = imported;
 
     is_table_element_type_compatible(*exported_ty, *imported_ty)
@@ -284,6 +288,17 @@ impl FunctionType {
     /// Return types.
     pub fn results(&self) -> &[Type] {
         &self.results
+    }
+
+    /// Returns a stable 32-bit signature hash derived from the Wasm value types.
+    pub fn signature_hash(&self) -> u32 {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&self.results.len().to_le_bytes());
+        hasher.update(&self.params.len().to_le_bytes());
+        for ty in self.results.iter().chain(self.params.iter()) {
+            hasher.update(&[*ty as u8]);
+        }
+        hasher.finalize()
     }
 }
 
@@ -418,8 +433,82 @@ impl fmt::Display for GlobalType {
     }
 }
 
-/// Globals are initialized via the `const` operators or by referring to another import.
-#[derive(Debug, Clone, Copy, PartialEq, RkyvSerialize, RkyvDeserialize, Archive)]
+/// A serializable sequence of operators for init expressions in globals,
+/// element offsets and data offsets.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, RkyvSerialize, RkyvDeserialize, Archive)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+#[rkyv(derive(Debug), compare(PartialEq))]
+pub struct InitExpr {
+    /// Operators in stack-machine order, excluding the terminating `end`.
+    pub ops: Box<[InitExprOp]>,
+}
+
+impl InitExpr {
+    /// Creates a new init expression.
+    pub fn new<Ops>(ops: Ops) -> Self
+    where
+        Ops: Into<Box<[InitExprOp]>>,
+    {
+        Self { ops: ops.into() }
+    }
+
+    /// Returns the operators that form this expression.
+    pub fn ops(&self) -> &[InitExprOp] {
+        &self.ops
+    }
+}
+
+/// Supported operators in serialized init expressions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, RkyvSerialize, RkyvDeserialize, Archive)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+#[rkyv(derive(Debug), compare(PartialEq))]
+#[repr(u8)]
+pub enum InitExprOp {
+    /// A `global.get` of an `i32` global.
+    GlobalGetI32(GlobalIndex),
+    /// A `global.get` of an `i64` global.
+    GlobalGetI64(GlobalIndex),
+    /// An `i32.const`.
+    I32Const(i32),
+    /// An `i32.add`.
+    I32Add,
+    /// An `i32.sub`.
+    I32Sub,
+    /// An `i32.mul`.
+    I32Mul,
+    /// An `i64.const`.
+    I64Const(i64),
+    /// An `i64.add`.
+    I64Add,
+    /// An `i64.sub`.
+    I64Sub,
+    /// An `i64.mul`.
+    I64Mul,
+}
+
+impl InitExprOp {
+    /// Return true if the expression is 32-bit
+    pub fn is_32bit_expression(&self) -> bool {
+        match self {
+            Self::GlobalGetI32(..)
+            | Self::I32Const(_)
+            | Self::I32Add
+            | Self::I32Sub
+            | Self::I32Mul => true,
+            Self::GlobalGetI64(_)
+            | Self::I64Const(_)
+            | Self::I64Add
+            | Self::I64Sub
+            | Self::I64Mul => false,
+        }
+    }
+}
+
+/// Globals are initialized via `const` operators, references, or a serialized
+/// expression.
+#[derive(Debug, Clone, PartialEq, RkyvSerialize, RkyvDeserialize, Archive)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 #[rkyv(derive(Debug), compare(PartialEq))]
@@ -444,6 +533,8 @@ pub enum GlobalInit {
     RefNullConst,
     /// A `ref.func <index>`.
     RefFunc(FunctionIndex),
+    /// A serialized init expression.
+    Expr(InitExpr),
 }
 
 // Tag Types
@@ -471,7 +562,7 @@ pub enum TagKind {
 pub struct TagType {
     /// The kind of the tag.
     pub kind: TagKind,
-    /// The parameters of the function
+    /// The parameters of the tag
     pub params: Box<[Type]>,
 }
 
@@ -526,6 +617,8 @@ pub struct TableType {
     pub minimum: u32,
     /// The maximum number of elements in the table.
     pub maximum: Option<u32>,
+    /// Whether the table is known to be immutable at runtime.
+    pub readonly: bool,
 }
 
 impl TableType {
@@ -536,7 +629,13 @@ impl TableType {
             ty,
             minimum,
             maximum,
+            readonly: false,
         }
+    }
+
+    /// Return true if it's a function reference table with a fixed number of elements.
+    pub fn is_fixed_funcref_table(&self) -> bool {
+        matches!(self.ty, Type::FuncRef) && self.maximum == Some(self.minimum)
     }
 }
 
@@ -604,7 +703,7 @@ impl fmt::Display for MemoryType {
 /// API. Each `ImportType` describes an import into the wasm module
 /// with the module/name that it's imported from as well as the type
 /// of item that's being imported.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, RkyvSerialize, RkyvDeserialize, Archive)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 pub struct ImportType<T = ExternType> {
     module: String,
@@ -651,7 +750,7 @@ impl<T> ImportType<T> {
 /// The `<T>` refefers to `ExternType`, however it can also refer to use
 /// `MemoryType`, `TableType`, `FunctionType` and `GlobalType` for ease of
 /// use.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, RkyvSerialize, RkyvDeserialize, Archive)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 pub struct ExportType<T = ExternType> {
     name: String,
@@ -710,5 +809,22 @@ mod tests {
         let ty: FunctionType = NINE_V128_TO_NINE_I32.into();
         assert_eq!(ty.params().len(), 9);
         assert_eq!(ty.results().len(), 9);
+    }
+
+    #[test]
+    fn signature_hash_is_stable() {
+        let ty: FunctionType = ([Type::I32, Type::F64], [Type::ExternRef]).into();
+        assert_eq!(ty.signature_hash(), ty.signature_hash());
+    }
+
+    #[test]
+    fn signature_hash_distinguishes() {
+        let left: FunctionType = ([Type::I32], [Type::I64]).into();
+        let right: FunctionType = ([Type::I64], [Type::I32]).into();
+        assert_ne!(left.signature_hash(), right.signature_hash());
+
+        let left: FunctionType = ([], [Type::I32, Type::I64]).into();
+        let right: FunctionType = ([Type::I32], [Type::I64]).into();
+        assert_ne!(left.signature_hash(), right.signature_hash());
     }
 }

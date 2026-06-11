@@ -1,4 +1,4 @@
-use std::{fmt::Display, str::FromStr};
+use std::{borrow::Cow, fmt::Display, str::FromStr};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::Error};
@@ -25,7 +25,7 @@ pub enum SnapshotTrigger {
     Sigtstp,
     /// The SIGSTOP signal instructs the operating system to stop a process for later resumption.
     Sigstop,
-    /// When a non-determinstic call is made
+    /// When a non-deterministic call is made
     NonDeterministicCall,
     /// Bootstrapping process
     Bootstrap,
@@ -107,11 +107,19 @@ impl<'de> Deserialize<'de> for SnapshotTrigger {
 }
 
 impl JsonSchema for SnapshotTrigger {
-    fn schema_name() -> String {
-        "SnapshotTrigger".to_owned()
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("SnapshotTrigger")
     }
 
-    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         <String as JsonSchema>::json_schema(generator)
+    }
+
+    fn inline_schema() -> bool {
+        false
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        Self::schema_name()
     }
 }

@@ -3,7 +3,7 @@
 #![allow(unused_imports, dead_code)]
 
 use crate::codegen::FuncGen;
-use crate::config::Singlepass;
+use crate::config::{self, Singlepass};
 #[cfg(feature = "unwind")]
 use crate::dwarf::WriterRelocate;
 use crate::machine::Machine;
@@ -11,6 +11,7 @@ use crate::machine::{
     gen_import_call_trampoline, gen_std_dynamic_import_trampoline, gen_std_trampoline,
 };
 use crate::machine_arm64::MachineARM64;
+use crate::machine_riscv::MachineRiscv;
 use crate::machine_x64::MachineX86_64;
 #[cfg(feature = "unwind")]
 use crate::unwind::{UnwindFrame, create_systemv_cie};
@@ -19,7 +20,11 @@ use enumset::EnumSet;
 use gimli::write::{EhFrame, FrameTable, Writer};
 #[cfg(feature = "rayon")]
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+use std::collections::HashMap;
 use std::sync::Arc;
+use wasmer_compiler::WASM_TRAMPOLINE_ESTIMATED_BODY_SIZE;
+use wasmer_compiler::misc::{CompiledKind, save_assembly_to_file, types_to_signature};
+use wasmer_compiler::progress::ProgressContext;
 use wasmer_compiler::{
     Compiler, CompilerConfig, FunctionBinaryReader, FunctionBodyData, MiddlewareBinaryReader,
     ModuleMiddleware, ModuleMiddlewareChain, ModuleTranslationState,
@@ -32,8 +37,8 @@ use wasmer_compiler::{
 use wasmer_types::entity::{EntityRef, PrimaryMap};
 use wasmer_types::target::{Architecture, CallingConvention, CpuFeature, Target};
 use wasmer_types::{
-    CompileError, FunctionIndex, FunctionType, LocalFunctionIndex, MemoryIndex, ModuleInfo,
-    TableIndex, TrapCode, TrapInformation, VMOffsets,
+    CompilationProgressCallback, CompileError, FunctionIndex, FunctionType, LocalFunctionIndex,
+    MemoryIndex, ModuleInfo, TableIndex, TrapCode, TrapInformation, Type, VMOffsets,
 };
 
 /// A compiler that compiles a WebAssembly module with Singlepass.
@@ -53,51 +58,52 @@ impl SinglepassCompiler {
     fn config(&self) -> &Singlepass {
         &self.config
     }
-}
 
-impl Compiler for SinglepassCompiler {
-    fn name(&self) -> &str {
-        "singlepass"
-    }
-
-    fn deterministic_id(&self) -> String {
-        String::from("singlepass")
-    }
-
-    /// Get the middlewares for this compiler
-    fn get_middlewares(&self) -> &[Arc<dyn ModuleMiddleware>] {
-        &self.config.middlewares
-    }
-
-    /// Compile the module using Singlepass, producing a compilation result with
-    /// associated relocations.
-    fn compile_module(
+    fn compile_module_internal(
         &self,
         target: &Target,
         compile_info: &CompileModuleInfo,
-        _module_translation: &ModuleTranslationState,
         function_body_inputs: PrimaryMap<LocalFunctionIndex, FunctionBodyData<'_>>,
+        progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<Compilation, CompileError> {
-        match target.triple().architecture {
+        let arch = target.triple().architecture;
+        match arch {
             Architecture::X86_64 => {}
             Architecture::Aarch64(_) => {}
+            Architecture::Riscv64(_) => {}
             _ => {
                 return Err(CompileError::UnsupportedTarget(
                     target.triple().architecture.to_string(),
                 ));
             }
-        }
+        };
 
         let calling_convention = match target.triple().default_calling_convention() {
             Ok(CallingConvention::WindowsFastcall) => CallingConvention::WindowsFastcall,
             Ok(CallingConvention::SystemV) => CallingConvention::SystemV,
             Ok(CallingConvention::AppleAarch64) => CallingConvention::AppleAarch64,
-            _ => {
-                return Err(CompileError::UnsupportedTarget(
-                    "Unsupported Calling convention for Singlepass compiler".to_string(),
-                ));
-            }
+            _ => match target.triple().architecture {
+                Architecture::Riscv64(_) => CallingConvention::SystemV,
+                _ => {
+                    return Err(CompileError::UnsupportedTarget(
+                        "Unsupported Calling convention for Singlepass compiler".to_string(),
+                    ));
+                }
+            },
         };
+
+        let module = &compile_info.module;
+        let total_function_call_trampolines = module.signatures.len() as u64;
+        let total_dynamic_trampolines = module.num_imported_functions as u64;
+        let total_steps = WASM_TRAMPOLINE_ESTIMATED_BODY_SIZE
+            * ((total_dynamic_trampolines + total_function_call_trampolines) as u64)
+            + function_body_inputs
+                .iter()
+                .map(|(_, body)| body.data.len() as u64)
+                .sum::<u64>();
+        let progress = progress_callback
+            .cloned()
+            .map(|cb| ProgressContext::new(cb, total_steps, "singlepass::functions"));
 
         // Generate the frametable
         #[cfg(feature = "unwind")]
@@ -167,7 +173,7 @@ impl Compiler for SinglepassCompiler {
                     }
                 }
 
-                match target.triple().architecture {
+                let res = match arch {
                     Architecture::X86_64 => {
                         let machine = MachineX86_64::new(Some(target.clone()))?;
                         let mut generator = FuncGen::new(
@@ -187,7 +193,7 @@ impl Compiler for SinglepassCompiler {
                             generator.feed_operator(op)?;
                         }
 
-                        generator.finalize(input)
+                        generator.finalize(input, arch)
                     }
                     Architecture::Aarch64(_) => {
                         let machine = MachineARM64::new(Some(target.clone()));
@@ -208,21 +214,73 @@ impl Compiler for SinglepassCompiler {
                             generator.feed_operator(op)?;
                         }
 
-                        generator.finalize(input)
+                        generator.finalize(input, arch)
+                    }
+                    Architecture::Riscv64(_) => {
+                        let machine = MachineRiscv::new(
+                            Some(target.clone()),
+                            self.config.allow_experimental_unaligned_memory_accesses,
+                        )?;
+                        let mut generator = FuncGen::new(
+                            module,
+                            &self.config,
+                            &vmoffsets,
+                            memory_styles,
+                            table_styles,
+                            i,
+                            &locals,
+                            machine,
+                            calling_convention,
+                        )?;
+                        while generator.has_control_frames() {
+                            generator.set_srcloc(reader.original_position() as u32);
+                            let op = reader.read_operator()?;
+                            generator.feed_operator(op)?;
+                        }
+
+                        generator.finalize(input, arch)
                     }
                     _ => unimplemented!(),
+                }?;
+
+                if let Some(progress) = progress.as_ref() {
+                    progress.notify_steps(input.data.len() as u64)?;
                 }
+
+                Ok(res)
             })
             .collect::<Result<Vec<_>, CompileError>>()?
             .into_iter()
             .unzip();
 
+        let module_hash = module.hash_string();
         let function_call_trampolines = module
             .signatures
             .values()
             .collect::<Vec<_>>()
             .into_par_iter_if_rayon()
-            .map(|func_type| gen_std_trampoline(func_type, target, calling_convention))
+            .map(|func_type| -> Result<FunctionBody, CompileError> {
+                let body = gen_std_trampoline(func_type, target, calling_convention)?;
+                if let Some(callbacks) = self.config.callbacks.as_ref() {
+                    callbacks.obj_memory_buffer(
+                        &CompiledKind::FunctionCallTrampoline(func_type.clone()),
+                        &module_hash,
+                        &body.body,
+                    );
+                    callbacks.asm_memory_buffer(
+                        &CompiledKind::FunctionCallTrampoline(func_type.clone()),
+                        &module_hash,
+                        arch,
+                        &body.body,
+                        HashMap::new(),
+                    )?;
+                }
+                if let Some(progress) = progress.as_ref() {
+                    progress.notify_steps(WASM_TRAMPOLINE_ESTIMATED_BODY_SIZE)?;
+                }
+
+                Ok(body)
+            })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .collect::<PrimaryMap<_, _>>();
@@ -231,13 +289,31 @@ impl Compiler for SinglepassCompiler {
             .imported_function_types()
             .collect::<Vec<_>>()
             .into_par_iter_if_rayon()
-            .map(|func_type| {
-                gen_std_dynamic_import_trampoline(
+            .map(|func_type| -> Result<FunctionBody, CompileError> {
+                let body = gen_std_dynamic_import_trampoline(
                     &vmoffsets,
                     &func_type,
                     target,
                     calling_convention,
-                )
+                )?;
+                if let Some(callbacks) = self.config.callbacks.as_ref() {
+                    callbacks.obj_memory_buffer(
+                        &CompiledKind::DynamicFunctionTrampoline(func_type.clone()),
+                        &module_hash,
+                        &body.body,
+                    );
+                    callbacks.asm_memory_buffer(
+                        &CompiledKind::DynamicFunctionTrampoline(func_type.clone()),
+                        &module_hash,
+                        arch,
+                        &body.body,
+                        HashMap::new(),
+                    )?;
+                }
+                if let Some(progress) = progress.as_ref() {
+                    progress.notify_steps(WASM_TRAMPOLINE_ESTIMATED_BODY_SIZE)?;
+                }
+                Ok(body)
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
@@ -272,6 +348,62 @@ impl Compiler for SinglepassCompiler {
             unwind_info,
             got,
         })
+    }
+}
+
+impl Compiler for SinglepassCompiler {
+    fn name(&self) -> &str {
+        "singlepass"
+    }
+
+    fn deterministic_id(&self) -> String {
+        String::from("singlepass")
+    }
+
+    /// Get the middlewares for this compiler
+    fn get_middlewares(&self) -> &[Arc<dyn ModuleMiddleware>] {
+        &self.config.middlewares
+    }
+
+    /// Compile the module using Singlepass, producing a compilation result with
+    /// associated relocations.
+    fn compile_module(
+        &self,
+        target: &Target,
+        compile_info: &CompileModuleInfo,
+        _module_translation: &ModuleTranslationState,
+        function_body_inputs: PrimaryMap<LocalFunctionIndex, FunctionBodyData<'_>>,
+        progress_callback: Option<&CompilationProgressCallback>,
+    ) -> Result<Compilation, CompileError> {
+        #[cfg(feature = "rayon")]
+        {
+            let num_threads = self.config.num_threads.get();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .build()
+                .map_err(|e| {
+                    CompileError::Codegen(format!("failed to build rayon thread pool: {e}"))
+                })?;
+
+            pool.install(|| {
+                self.compile_module_internal(
+                    target,
+                    compile_info,
+                    function_body_inputs,
+                    progress_callback,
+                )
+            })
+        }
+
+        #[cfg(not(feature = "rayon"))]
+        {
+            self.compile_module_internal(
+                target,
+                compile_info,
+                function_body_inputs,
+                progress_callback,
+            )
+        }
     }
 
     fn get_cpu_features_used(&self, cpu_features: &EnumSet<CpuFeature>) -> EnumSet<CpuFeature> {
@@ -333,7 +465,7 @@ mod tests {
         // Compile for 32bit Linux
         let linux32 = Target::new(triple!("i686-unknown-linux-gnu"), CpuFeature::for_host());
         let (info, translation, inputs) = dummy_compilation_ingredients();
-        let result = compiler.compile_module(&linux32, &info, &translation, inputs);
+        let result = compiler.compile_module(&linux32, &info, &translation, inputs, None);
         match result.unwrap_err() {
             CompileError::UnsupportedTarget(name) => assert_eq!(name, "i686"),
             error => panic!("Unexpected error: {error:?}"),
@@ -342,7 +474,7 @@ mod tests {
         // Compile for win32
         let win32 = Target::new(triple!("i686-pc-windows-gnu"), CpuFeature::for_host());
         let (info, translation, inputs) = dummy_compilation_ingredients();
-        let result = compiler.compile_module(&win32, &info, &translation, inputs);
+        let result = compiler.compile_module(&win32, &info, &translation, inputs, None);
         match result.unwrap_err() {
             CompileError::UnsupportedTarget(name) => assert_eq!(name, "i686"), // Windows should be checked before architecture
             error => panic!("Unexpected error: {error:?}"),
@@ -350,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn errors_for_unsuported_cpufeatures() {
+    fn errors_for_unsupported_cpufeatures() {
         let compiler = SinglepassCompiler::new(Singlepass::default());
         let mut features =
             CpuFeature::AVX | CpuFeature::SSE42 | CpuFeature::LZCNT | CpuFeature::BMI1;

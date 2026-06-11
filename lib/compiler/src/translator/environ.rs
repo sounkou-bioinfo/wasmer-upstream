@@ -5,15 +5,16 @@ use crate::lib::std::string::ToString;
 use crate::lib::std::{boxed::Box, string::String, vec::Vec};
 use crate::translate_module;
 use crate::wasmparser::{Operator, ValType};
+use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::ops::Range;
 use wasmer_types::FunctionType;
 use wasmer_types::entity::PrimaryMap;
 use wasmer_types::{
     CustomSectionIndex, DataIndex, DataInitializer, DataInitializerLocation, ElemIndex,
-    ExportIndex, FunctionIndex, GlobalIndex, GlobalInit, GlobalType, ImportIndex,
-    LocalFunctionIndex, MemoryIndex, MemoryType, ModuleInfo, SignatureIndex, TableIndex,
-    TableInitializer, TableType,
+    ExportIndex, FunctionIndex, GlobalIndex, GlobalInit, GlobalType, ImportIndex, InitExpr,
+    LocalFunctionIndex, MemoryIndex, MemoryType, ModuleInfo, SignatureHash, SignatureIndex,
+    TableIndex, TableInitializer, TableType,
 };
 use wasmer_types::{TagIndex, WasmResult};
 
@@ -88,6 +89,7 @@ impl<'data> ModuleEnvironment<'data> {
     pub fn translate(mut self, data: &'data [u8]) -> WasmResult<Self> {
         assert!(self.module_translation_state.is_none());
         let module_translation_state = translate_module(data, &mut self)?;
+        self.module.validate_signature_hashes()?;
         self.module_translation_state = Some(module_translation_state);
 
         Ok(self)
@@ -125,7 +127,9 @@ impl<'data> ModuleEnvironment<'data> {
 
     pub(crate) fn declare_signature(&mut self, sig: FunctionType) -> WasmResult<()> {
         // TODO: Deduplicate signatures.
+        let signature_hash = SignatureHash::new(sig.signature_hash());
         self.module.signatures.push(sig);
+        self.module.signature_hashes.push(signature_hash);
         Ok(())
     }
 
@@ -378,14 +382,12 @@ impl<'data> ModuleEnvironment<'data> {
     pub(crate) fn declare_table_initializers(
         &mut self,
         table_index: TableIndex,
-        base: Option<GlobalIndex>,
-        offset: usize,
+        offset_expr: InitExpr,
         elements: Box<[FunctionIndex]>,
     ) -> WasmResult<()> {
         self.module.table_initializers.push(TableInitializer {
             table_index,
-            base,
-            offset,
+            offset_expr,
             elements,
         });
         Ok(())
@@ -427,15 +429,13 @@ impl<'data> ModuleEnvironment<'data> {
     pub(crate) fn declare_data_initialization(
         &mut self,
         memory_index: MemoryIndex,
-        base: Option<GlobalIndex>,
-        offset: usize,
+        offset_expr: InitExpr,
         data: &'data [u8],
     ) -> WasmResult<()> {
         self.data_initializers.push(DataInitializer {
             location: DataInitializerLocation {
                 memory_index,
-                base,
-                offset,
+                offset_expr,
             },
             data,
         });
@@ -466,14 +466,11 @@ impl<'data> ModuleEnvironment<'data> {
         Ok(())
     }
 
-    pub(crate) fn declare_function_name(
+    pub(crate) fn declare_function_names(
         &mut self,
-        func_index: FunctionIndex,
-        name: &'data str,
+        functions: HashMap<FunctionIndex, String>,
     ) -> WasmResult<()> {
-        self.module
-            .function_names
-            .insert(func_index, name.to_string());
+        self.module.function_names = functions;
         Ok(())
     }
 

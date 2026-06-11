@@ -88,7 +88,7 @@ impl AsyncCliCommand for CmdSsh {
         let mut cmd = std::process::Command::new("ssh");
         let mut cmd = cmd
             .args([
-                // No controlpath becaue we don't want to re-use connections
+                // No controlpath because we don't want to re-use connections
                 "-o",
                 "ControlPath=none",
                 // Disable host key checking, because we use a DNS-load-balanced
@@ -116,7 +116,7 @@ impl AsyncCliCommand for CmdSsh {
         if self.print {
             print!("ssh");
             for arg in cmd.get_args() {
-                print!(" {}", arg.to_string_lossy().as_ref());
+                print!(" {}", arg.to_string_lossy());
             }
             println!();
             return Ok(());

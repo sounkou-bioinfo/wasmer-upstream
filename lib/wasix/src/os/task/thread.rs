@@ -1,3 +1,14 @@
+use super::{
+    control_plane::TaskCountGuard,
+    task_join_handle::{OwnedTaskStatus, TaskJoinHandle},
+};
+use crate::{
+    WasiRuntimeError,
+    os::task::process::{WasiProcessId, WasiProcessInner},
+    state::LinkError,
+    syscalls::HandleRewindType,
+};
+use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
@@ -6,25 +17,11 @@ use std::{
     sync::{Arc, Condvar, Mutex, Weak},
     task::Waker,
 };
-
-use bytes::{Bytes, BytesMut};
 use wasmer::{ExportError, InstantiationError, MemoryError};
 use wasmer_wasix_types::{
     types::Signal,
     wasi::{Errno, ExitCode},
     wasix::ThreadStartType,
-};
-
-use crate::{
-    WasiRuntimeError,
-    os::task::process::{WasiProcessId, WasiProcessInner},
-    state::LinkError,
-    syscalls::HandleRewindType,
-};
-
-use super::{
-    control_plane::TaskCountGuard,
-    task_join_handle::{OwnedTaskStatus, TaskJoinHandle},
 };
 
 /// Represents the ID of a WASI thread
@@ -318,7 +315,9 @@ impl WasiThread {
     /// just return that earlier set exit code
     pub fn set_or_get_exit_code_for_signal(&self, sig: Signal) -> ExitCode {
         let default_exitcode: ExitCode = match sig {
-            Signal::Sigquit | Signal::Sigabrt => Errno::Success.into(),
+            Signal::Sigquit => Errno::Success.into(),
+            // Match the POSIX shell convention for signal termination.
+            Signal::Sigabrt => ExitCode::from(128 + sig as i32),
             Signal::Sigpipe => Errno::Pipe.into(),
             _ => Errno::Intr.into(),
         };
@@ -542,11 +541,8 @@ impl WasiThread {
                     snapshot.store_data.clone(),
                 ));
             }
-            if let Some(next) = pstack.next.as_ref() {
-                pstack = next.deref();
-            } else {
-                return None;
-            }
+            let next = pstack.next.as_ref()?;
+            pstack = next.deref();
         }
     }
 
@@ -626,6 +622,8 @@ pub enum WasiThreadError {
     MemoryCreateFailed(MemoryError),
     #[error("{0}")]
     ExportError(ExportError),
+    #[error("Failed to create additional imports - {0}")]
+    AdditionalImportCreationFailed(Arc<anyhow::Error>),
     #[error("Linker error: {0}")]
     LinkError(Arc<LinkError>),
     #[error("Failed to create the instance - {0}")]
@@ -645,6 +643,7 @@ impl From<WasiThreadError> for Errno {
             WasiThreadError::MethodNotFound => Errno::Inval,
             WasiThreadError::MemoryCreateFailed(_) => Errno::Nomem,
             WasiThreadError::ExportError(_) => Errno::Noexec,
+            WasiThreadError::AdditionalImportCreationFailed(_) => Errno::Noexec,
             WasiThreadError::LinkError(_) => Errno::Noexec,
             WasiThreadError::InstanceCreateFailed(_) => Errno::Noexec,
             WasiThreadError::InitFailed(_) => Errno::Noexec,

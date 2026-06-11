@@ -62,7 +62,7 @@ impl<T> FunctionEnv<T> {
     }
 
     /// Convert it into a `FunctionEnvMut`
-    pub fn into_mut(self, store: &mut impl AsStoreMut) -> FunctionEnvMut<T>
+    pub fn into_mut<'a>(self, store: &'a mut impl AsStoreMut) -> FunctionEnvMut<'a, T>
     where
         T: Any + Send + 'static + Sized,
     {
@@ -113,12 +113,12 @@ where
 }
 
 impl<T: Send + 'static> FunctionEnvMut<'_, T> {
-    /// Returns a reference to the host state in this function environement.
+    /// Returns a reference to the host state in this function environment.
     pub fn data(&self) -> &T {
         self.func_env.as_ref(&self.store_mut)
     }
 
-    /// Returns a mutable- reference to the host state in this function environement.
+    /// Returns a mutable- reference to the host state in this function environment.
     pub fn data_mut(&mut self) -> &mut T {
         self.func_env.as_mut(&mut self.store_mut)
     }
@@ -137,7 +137,7 @@ impl<T: Send + 'static> FunctionEnvMut<'_, T> {
     }
 
     /// Borrows a new mutable reference of both the attached Store and host state
-    pub fn data_and_store_mut(&mut self) -> (&mut T, StoreMut) {
+    pub fn data_and_store_mut<'a>(&'a mut self) -> (&'a mut T, StoreMut<'a>) {
         let data = self.func_env.as_mut(&mut self.store_mut) as *mut T;
         // telling the borrow check to close his eyes here
         // this is still relatively safe to do as func_env are
@@ -147,12 +147,6 @@ impl<T: Send + 'static> FunctionEnvMut<'_, T> {
         (data, self.store_mut.as_store_mut())
     }
 }
-
-//impl<T> Into<crate::FunctionEnv<T>> for FunctionEnv<T> {
-//    fn into(self) -> crate::FunctionEnv<T> {
-//        crate::FunctionEnv::Wamr(self)
-//    }
-//}
 
 impl<T> AsStoreRef for FunctionEnvMut<'_, T> {
     fn as_store_ref(&self) -> StoreRef<'_> {

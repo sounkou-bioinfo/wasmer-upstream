@@ -1,12 +1,11 @@
 use std::{
     collections::HashMap,
-    fmt::Write as _,
-    io::{ErrorKind, Write as _},
+    io::{ErrorKind, Read, Write as _},
     path::PathBuf,
     sync::{Arc, RwLock},
 };
 
-use anyhow::{Context, Error};
+use anyhow::{Context, Error, bail};
 use bytes::Bytes;
 use http::{HeaderMap, Method};
 use tempfile::NamedTempFile;
@@ -32,7 +31,7 @@ use crate::{
 #[derive(Debug)]
 pub struct BuiltinPackageLoader {
     client: Arc<dyn HttpClient + Send + Sync>,
-    in_memory: InMemoryCache,
+    in_memory: Option<InMemoryCache>,
     cache: Option<FileSystemCache>,
     /// A mapping from hostnames to tokens
     tokens: HashMap<String, String>,
@@ -55,7 +54,7 @@ pub enum HashIntegrityValidationMode {
 impl BuiltinPackageLoader {
     pub fn new() -> Self {
         BuiltinPackageLoader {
-            in_memory: InMemoryCache::default(),
+            in_memory: Some(InMemoryCache::default()),
             client: Arc::new(crate::http::default_http_client().unwrap()),
             cache: None,
             hash_validation: HashIntegrityValidationMode::NoValidate,
@@ -76,6 +75,14 @@ impl BuiltinPackageLoader {
             cache: Some(FileSystemCache {
                 cache_dir: cache_dir.into(),
             }),
+            ..self
+        }
+    }
+
+    /// Disable promotion of loaded containers into the in-memory cache.
+    pub fn without_in_memory_cache(self) -> Self {
+        BuiltinPackageLoader {
+            in_memory: None,
             ..self
         }
     }
@@ -156,21 +163,35 @@ impl BuiltinPackageLoader {
 
     /// Insert a container into the in-memory hash.
     pub fn insert_cached(&self, hash: WebcHash, container: &Container) {
-        self.in_memory.save(container, hash);
+        if let Some(in_memory) = &self.in_memory {
+            in_memory.save(container, hash);
+        }
+    }
+
+    /// Remove a container from the in-memory cache.
+    pub fn evict_cached(&self, hash: &WebcHash) -> Option<Container> {
+        self.in_memory
+            .as_ref()
+            .and_then(|in_memory| in_memory.remove(hash))
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(pkg.hash=%hash))]
     async fn get_cached(&self, hash: &WebcHash) -> Result<Option<Container>, Error> {
-        if let Some(cached) = self.in_memory.lookup(hash) {
+        if let Some(cached) = self
+            .in_memory
+            .as_ref()
+            .and_then(|in_memory| in_memory.lookup(hash))
+        {
             return Ok(Some(cached));
         }
 
         if let Some(cache) = self.cache.as_ref()
             && let Some(cached) = cache.lookup(hash).await?
         {
-            // Note: We want to propagate it to the in-memory cache, too
-            tracing::debug!("Copying from the filesystem cache to the in-memory cache");
-            self.in_memory.save(&cached, *hash);
+            if let Some(in_memory) = &self.in_memory {
+                tracing::debug!("Copying from the filesystem cache to the in-memory cache");
+                in_memory.save(&cached, *hash);
+            }
             return Ok(Some(cached));
         }
 
@@ -284,6 +305,8 @@ impl BuiltinPackageLoader {
         }
 
         let body = response.body.context("package download failed")?;
+        let body = Self::decode_response_body(&response.headers, body)
+            .context("package download failed: could not decode response body")?;
         tracing::debug!(%url, "package_download_succeeded");
 
         let body = bytes::Bytes::from(body);
@@ -297,6 +320,15 @@ impl BuiltinPackageLoader {
         let mut headers = HeaderMap::new();
         headers.insert("Accept", "application/webc".parse().unwrap());
         headers.insert("User-Agent", USER_AGENT.parse().unwrap());
+
+        // Accept compressed responses.
+        // NOTE: gzip and zstd decoding is available on native platforms.
+        // In browser platforms, the fetch implementation should automatically
+        // handle decoding of gzip/zstd responses transparently.
+        headers.insert(
+            http::header::ACCEPT_ENCODING,
+            "zstd;q=1.0, gzip;q=0.8".parse().unwrap(),
+        );
 
         if url.has_authority()
             && let Some(token) = self.tokens.get(url.authority())
@@ -316,6 +348,62 @@ impl BuiltinPackageLoader {
         }
 
         headers
+    }
+
+    /// Decode the response body according to the `Content-Encoding` header.
+    ///
+    /// * Supports `gzip` and `zstd` encodings
+    /// * Supports nested encodings (e.g. `gzip, zstd`)
+    /// * Passes through unencoded bodies or "identity" encoding unchanged
+    fn decode_response_body(headers: &HeaderMap, body: Vec<u8>) -> Result<Vec<u8>, anyhow::Error> {
+        let encodings = match headers.get(http::header::CONTENT_ENCODING) {
+            Some(header) => header
+                .to_str()
+                .context("non-utf8 content-encoding header")?
+                .split(',')
+                .map(|encoding| encoding.trim().to_ascii_lowercase())
+                .filter(|encoding| !encoding.is_empty())
+                .collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
+
+        // Check if there is nothing to decode, return early.
+        // "identity" is the default encoding meaning "no encoding" (See RFC 2616 / RFC 7231)
+        if encodings.is_empty() || (encodings.len() == 1 && encodings[0] == "identity") {
+            return Ok(body);
+        }
+
+        let mut reader: Box<dyn Read> = Box::new(std::io::Cursor::new(body));
+        for encoding in encodings.iter().rev() {
+            match encoding.as_str() {
+                "gzip" => {
+                    reader = Box::new(flate2::read::GzDecoder::new(reader));
+                }
+                "zstd" => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        reader = Box::new(
+                            zstd::stream::read::Decoder::new(reader)
+                                .context("failed to initialize zstd decoder")?,
+                        );
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        // NOTE: in browsers this code will not be hit because
+                        // the fetch API automatically handles content decoding.
+                        bail!("zstd content-encoding is not supported on wasm32");
+                    }
+                }
+                "identity" => {}
+                other => bail!("unsupported content-encoding: {other}"),
+            }
+        }
+
+        let mut decoded = Vec::new();
+        reader
+            .read_to_end(&mut decoded)
+            .context("failed to decode response body")?;
+        Ok(decoded)
     }
 }
 
@@ -356,7 +444,9 @@ impl PackageLoader for BuiltinPackageLoader {
             {
                 Ok(container) => {
                     tracing::debug!("Cached to disk");
-                    self.in_memory.save(&container, summary.dist.webc_sha256);
+                    if let Some(in_memory) = &self.in_memory {
+                        in_memory.save(&container, summary.dist.webc_sha256);
+                    }
                     // The happy path - we've saved to both caches and loaded the
                     // container from disk (hopefully using mmap) so we're done.
                     return Ok(container);
@@ -376,8 +466,10 @@ impl PackageLoader for BuiltinPackageLoader {
         // The sad path - looks like we don't have a filesystem cache so we'll
         // need to keep the whole thing in memory.
         let container = crate::spawn_blocking(move || from_bytes(bytes)).await??;
-        // We still want to cache it in memory, of course
-        self.in_memory.save(&container, summary.dist.webc_sha256);
+        if let Some(in_memory) = &self.in_memory {
+            // We still want to cache it in memory, of course
+            in_memory.save(&container, summary.dist.webc_sha256);
+        }
         Ok(container)
     }
 
@@ -572,14 +664,11 @@ impl FileSystemCache {
     }
 
     fn path(&self, hash: &WebcHash) -> PathBuf {
-        let hash = hash.as_bytes();
-        let mut filename = String::with_capacity(hash.len() * 2);
-        for b in hash {
-            write!(filename, "{b:02x}").unwrap();
-        }
-        filename.push_str(Self::FILE_SUFFIX);
-
-        self.cache_dir.join(filename)
+        self.cache_dir.join(format!(
+            "{}{}",
+            hex::encode(hash.as_bytes()),
+            Self::FILE_SUFFIX
+        ))
     }
 
     /// Scan all the cached webc files and invoke the callback for each.
@@ -686,14 +775,18 @@ impl InMemoryCache {
         let mut cache = self.0.write().unwrap();
         cache.entry(hash).or_insert_with(|| container.clone());
     }
+
+    fn remove(&self, hash: &WebcHash) -> Option<Container> {
+        self.0.write().unwrap().remove(hash)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Mutex};
+    use std::{collections::VecDeque, io::Write, sync::Mutex};
 
     use futures::future::BoxFuture;
-    use http::{HeaderMap, StatusCode};
+    use http::{HeaderMap, HeaderValue, StatusCode};
     use tempfile::TempDir;
     use wasmer_config::package::PackageId;
 
@@ -704,7 +797,8 @@ mod tests {
 
     use super::*;
 
-    const PYTHON: &[u8] = include_bytes!("../../../../c-api/examples/assets/python-0.1.0.wasmer");
+    const PYTHON: &[u8] =
+        include_bytes!("../../../../../wasmer-test-files/examples/python-0.1.0.wasmer");
 
     #[derive(Debug)]
     pub(crate) struct DummyClient {
@@ -764,7 +858,16 @@ mod tests {
         let request = &requests[0];
         assert_eq!(request.url, summary.dist.webc);
         assert_eq!(request.method, "GET");
-        assert_eq!(request.headers.len(), 2);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            assert_eq!(request.headers.len(), 3);
+            assert_eq!(request.headers["Accept-Encoding"], "zstd;q=1.0, gzip;q=0.8");
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            assert_eq!(request.headers.len(), 2);
+            assert!(!request.headers.contains_key(http::header::ACCEPT_ENCODING));
+        }
         assert_eq!(request.headers["Accept"], "application/webc");
         assert_eq!(request.headers["User-Agent"], USER_AGENT);
         // Make sure we got the right package
@@ -779,7 +882,7 @@ mod tests {
         assert!(path.exists());
         assert_eq!(std::fs::read(&path).unwrap(), PYTHON);
         // and cached in memory for next time
-        let in_memory = loader.in_memory.0.read().unwrap();
+        let in_memory = loader.in_memory.as_ref().unwrap().0.read().unwrap();
         assert!(in_memory.contains_key(&summary.dist.webc_sha256));
     }
 
@@ -789,16 +892,218 @@ mod tests {
         cache_misses_will_trigger_a_download_internal().await
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn can_disable_in_memory_cache() {
+        let temp = TempDir::new().unwrap();
+        let client = Arc::new(DummyClient::with_responses([HttpResponse {
+            body: Some(PYTHON.to_vec()),
+            redirected: false,
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+        }]));
+        let loader = BuiltinPackageLoader::new()
+            .with_cache_dir(temp.path())
+            .without_in_memory_cache()
+            .with_shared_http_client(client);
+        let summary = PackageSummary {
+            pkg: PackageInfo {
+                id: PackageId::new_named("python/python", "0.1.0".parse().unwrap()),
+                dependencies: Vec::new(),
+                commands: Vec::new(),
+                entrypoint: Some("asdf".to_string()),
+                filesystem: Vec::new(),
+            },
+            dist: DistributionInfo {
+                webc: "https://wasmer.io/python/python".parse().unwrap(),
+                webc_sha256: [0xbb; 32].into(),
+            },
+        };
+
+        loader.load(&summary).await.unwrap();
+
+        assert!(loader.in_memory.is_none());
+    }
+
     #[cfg(target_arch = "wasm32")]
     #[tokio::test()]
     async fn cache_misses_will_trigger_a_download() {
         cache_misses_will_trigger_a_download_internal().await
     }
-}
 
-#[cfg(test)]
-mod test {
-    use super::*;
+    #[tokio::test]
+    async fn evict_cached_removes_in_memory_container() {
+        let loader = BuiltinPackageLoader::new();
+        let container = from_bytes(PYTHON).unwrap();
+        let hash: WebcHash = [0xaa; 32].into();
+        loader.insert_cached(hash, &container);
+        let evicted = loader.evict_cached(&hash);
+        assert!(evicted.is_some());
+        {
+            let in_memory = loader.in_memory.as_ref().unwrap().0.read().unwrap();
+            assert!(!in_memory.contains_key(&hash));
+        }
+        assert!(loader.evict_cached(&hash).is_none());
+    }
+
+    /// Small helper to construct headers with a given content-encoding.
+    fn headers_with_encoding(content_encoding: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = content_encoding {
+            headers.insert(http::header::CONTENT_ENCODING, value.parse().unwrap());
+        }
+        headers
+    }
+
+    /// Small helper to construct headers with a raw content-encoding value.
+    fn headers_with_raw_encoding(value: &[u8]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_ENCODING,
+            HeaderValue::from_bytes(value).unwrap(),
+        );
+        headers
+    }
+
+    /// Confirm decode_response_body passes through unencoded bodies unchanged.
+    #[test]
+    fn decode_response_body_passthrough() {
+        let body = b"plain-bytes".to_vec();
+
+        let decoded =
+            BuiltinPackageLoader::decode_response_body(&headers_with_encoding(None), body.clone())
+                .unwrap();
+        assert_eq!(decoded, body);
+
+        let decoded = BuiltinPackageLoader::decode_response_body(
+            &headers_with_encoding(Some("identity")),
+            body.clone(),
+        )
+        .unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    /// Confirm decode_response_body treats empty/whitespace encoding lists as no encoding.
+    #[test]
+    fn decode_response_body_empty_encoding_list() {
+        let body = b"plain-bytes".to_vec();
+        let decoded = BuiltinPackageLoader::decode_response_body(
+            &headers_with_encoding(Some(" , , ")),
+            body.clone(),
+        )
+        .unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    /// Confirm decode_response_body errors on non-utf8 content-encoding headers.
+    #[test]
+    fn decode_response_body_non_utf8_encoding_header() {
+        let body = b"bytes".to_vec();
+        let err =
+            BuiltinPackageLoader::decode_response_body(&headers_with_raw_encoding(&[0xff]), body)
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("non-utf8 content-encoding"));
+    }
+
+    /// Confirm decode_response_body decodes gzip-encoded bodies.
+    #[test]
+    fn decode_response_body_gzip() {
+        let body = b"gzip-bytes".to_vec();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&body).unwrap();
+        let encoded = encoder.finish().unwrap();
+
+        let decoded = BuiltinPackageLoader::decode_response_body(
+            &headers_with_encoding(Some("gzip")),
+            encoded,
+        )
+        .unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    /// Confirm decode_response_body ignores identity when combined with other encodings.
+    #[test]
+    fn decode_response_body_identity_and_gzip() {
+        let body = b"gzip-bytes".to_vec();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&body).unwrap();
+        let encoded = encoder.finish().unwrap();
+
+        let decoded = BuiltinPackageLoader::decode_response_body(
+            &headers_with_encoding(Some("identity, gzip")),
+            encoded,
+        )
+        .unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    /// Confirm decode_response_body errors on invalid gzip payloads.
+    #[test]
+    fn decode_response_body_gzip_invalid_payload() {
+        let body = b"not-gzip".to_vec();
+        let err =
+            BuiltinPackageLoader::decode_response_body(&headers_with_encoding(Some("gzip")), body)
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("failed to decode response body"));
+    }
+
+    /// Confirm decode_response_body decodes zstd-encoded bodies.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn decode_response_body_zstd() {
+        let body = b"zstd-bytes".to_vec();
+        let encoded = zstd::stream::encode_all(std::io::Cursor::new(&body), 0).unwrap();
+
+        let decoded = BuiltinPackageLoader::decode_response_body(
+            &headers_with_encoding(Some("zstd")),
+            encoded,
+        )
+        .unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    /// Confirm decode_response_body errors on invalid zstd payloads.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn decode_response_body_zstd_invalid_payload() {
+        let body = b"not-zstd".to_vec();
+        let err =
+            BuiltinPackageLoader::decode_response_body(&headers_with_encoding(Some("zstd")), body)
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("failed to decode response body"));
+    }
+
+    /// Confirm decode_response_body decodes layered gzip+zstd-encoded bodies.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn decode_response_body_zstd_and_gzip() {
+        let body = b"layered-bytes".to_vec();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&body).unwrap();
+        let gzipped = encoder.finish().unwrap();
+        let encoded = zstd::stream::encode_all(std::io::Cursor::new(gzipped), 0).unwrap();
+
+        let decoded = BuiltinPackageLoader::decode_response_body(
+            &headers_with_encoding(Some("gzip, zstd")),
+            encoded,
+        )
+        .unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    /// Confirm decode_response_body errors on unknown encodings.
+    #[test]
+    fn decode_response_body_unknown_encoding() {
+        let body = b"weird".to_vec();
+        let err =
+            BuiltinPackageLoader::decode_response_body(&headers_with_encoding(Some("br")), body)
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported content-encoding"));
+    }
 
     // NOTE: must be a tokio test because the BuiltinPackageLoader::new()
     // constructor requires a runtime...

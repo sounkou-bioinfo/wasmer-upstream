@@ -5,15 +5,19 @@ use std::sync::Arc;
 use bytes::Bytes;
 use wasmer_compiler::{Artifact, ArtifactCreate, Engine};
 use wasmer_types::{
-    CompileError, DeserializeError, ExportType, ExportsIterator, ImportType, ImportsIterator,
-    ModuleInfo, SerializeError,
+    CompilationProgressCallback, CompileError, DeserializeError, ExportType, ExportsIterator,
+    ImportType, ImportsIterator, ModuleInfo, SerializeError,
 };
+#[cfg(feature = "experimental-host-interrupt")]
+use wasmer_vm::interrupt_registry;
+use wasmer_vm::{Trap, TrapCode};
 
 use crate::{
-    AsStoreMut, AsStoreRef, BackendModule, IntoBytes,
+    AsStoreMut, AsStoreRef, BackendModule, IntoBytes, StoreContext,
     backend::sys::entities::engine::NativeEngineExt, engine::AsEngineRef,
     error::InstantiationError, vm::VMInstance,
 };
+use wasmer_vm::StoreHandle;
 
 #[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
@@ -45,12 +49,26 @@ impl Module {
         unsafe { Self::from_binary_unchecked(engine, binary) }
     }
 
+    pub(crate) fn from_binary_with_progress(
+        engine: &impl AsEngineRef,
+        binary: &[u8],
+        callback: CompilationProgressCallback,
+    ) -> Result<Self, CompileError> {
+        Self::validate(engine, binary)?;
+
+        let artifact = engine
+            .as_engine_ref()
+            .engine()
+            .as_sys()
+            .compile_with_progress(binary, Some(callback))?;
+        Ok(Self::from_artifact(artifact))
+    }
+
     pub(crate) unsafe fn from_binary_unchecked(
         engine: &impl AsEngineRef,
         binary: &[u8],
     ) -> Result<Self, CompileError> {
-        let module = Self::compile(engine, binary)?;
-        Ok(module)
+        Self::compile(engine, binary)
     }
 
     #[cfg(feature = "compiler")]
@@ -167,6 +185,7 @@ impl Module {
         }
         let signal_handler = store.as_store_ref().signal_handler();
         let mut store_mut = store.as_store_mut();
+        let store_ptr = store_mut.inner as *mut _;
         let (engine, objects) = store_mut.engine_and_objects_mut();
         let config = engine.tunables().vmconfig();
         unsafe {
@@ -174,18 +193,42 @@ impl Module {
                 engine.tunables(),
                 &imports
                     .iter()
-                    .map(|e| crate::Extern::to_vm_extern(e).into_sys())
+                    .map(|e| crate::Extern::to_vm_extern(e).unwrap_sys())
                     .collect::<Vec<_>>(),
                 objects.as_sys_mut(),
             )?;
+
+            let store_id = objects.id();
+            #[cfg(feature = "experimental-host-interrupt")]
+            let interrupt_guard = match interrupt_registry::install(store_id) {
+                Ok(x) => x,
+                Err(interrupt_registry::InstallError::AlreadyInterrupted) => {
+                    return Err(InstantiationError::Start(
+                        Trap::lib(TrapCode::HostInterrupt).into(),
+                    ));
+                }
+            };
+
+            let store_install_guard = StoreContext::ensure_installed(store_ptr);
 
             // After the instance handle is created, we need to initialize
             // the data, call the start function and so. However, if any
             // of this steps traps, we still need to keep the instance alive
             // as some of the Instance elements may have placed in other
             // instance tables.
-            self.artifact
-                .finish_instantiation(config, signal_handler, &mut instance_handle)?;
+            if let Err(err) =
+                self.artifact
+                    .finish_instantiation(config, signal_handler, &mut instance_handle)
+            {
+                // Keep the partially initialized instance alive: its funcrefs may already
+                // have been written into imported tables.
+                let _ = StoreHandle::new(objects.as_sys_mut(), instance_handle);
+                return Err(err.into());
+            }
+
+            drop(store_install_guard);
+            #[cfg(feature = "experimental-host-interrupt")]
+            drop(interrupt_guard);
 
             Ok(VMInstance::Sys(instance_handle))
         }
@@ -242,6 +285,23 @@ impl crate::Module {
         match self.0 {
             BackendModule::Sys(ref mut s) => s,
             _ => panic!("Not a `sys` module!"),
+        }
+    }
+
+    /// Returns the compiled [`Artifact`] backing this module, or `None` if this
+    /// is not a `sys`-backend module.
+    ///
+    /// # Security
+    ///
+    /// The artifact exposes host-process memory addresses (e.g. via
+    /// [`Artifact::finished_function_extents`]). These are not stable across
+    /// runs and must not be forwarded to untrusted parties, as they reveal
+    /// ASLR layout information.
+    pub fn sys_artifact(&self) -> Option<&Artifact> {
+        match self.0 {
+            BackendModule::Sys(ref s) => Some(&s.artifact),
+            #[allow(unreachable_patterns)]
+            _ => None,
         }
     }
 }

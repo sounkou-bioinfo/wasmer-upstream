@@ -1,5 +1,28 @@
 use super::*;
+use crate::fs::FlushPoller;
 use crate::syscalls::*;
+
+/// Best-effort flush of a file handle captured before fd removal.
+pub(crate) fn flush_captured_handle(
+    env: &WasiEnv,
+    flush_target: Option<
+        std::sync::Arc<std::sync::RwLock<Box<dyn virtual_fs::VirtualFile + Send + Sync>>>,
+    >,
+) -> Result<Errno, WasiError> {
+    let Some(file) = flush_target else {
+        return Ok(Errno::Success);
+    };
+
+    match __asyncify_light(env, None, FlushPoller { file })? {
+        Ok(_)
+        | Err(Errno::Isdir)
+        | Err(Errno::Io)
+        | Err(Errno::Access)
+        // EINVAL is returned by e.g. pipe-backed stdio and is safe to ignore.
+        | Err(Errno::Inval) => Ok(Errno::Success),
+        Err(e) => Ok(e),
+    }
+}
 
 /// ### `fd_close()`
 /// Close an open file descriptor
@@ -19,26 +42,18 @@ pub fn fd_close(mut ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd) -> Result<Errn
     let env = ctx.data();
     let (_, mut state) = unsafe { env.get_memory_and_wasi_state(&ctx, 0) };
 
-    // We don't want to allow programs that blindly close all FDs in a loop
-    // to be able to close pre-opens, as that breaks wasix-libc in rather
-    // spectacular fashion.
-    if let Ok(pfd) = state.fs.get_fd(fd)
-        && !pfd.is_stdio
-        && pfd.inode.is_preopened
-    {
+    let outcome = state.fs.close_fd_and_capture_flush(fd);
+
+    if outcome.skipped_preopen {
         trace!("Skipping fd_close for pre-opened FD ({})", fd);
         return Ok(Errno::Success);
     }
-    // HACK: we use tokio files to back WASI file handles. Since tokio
-    // does writes in the background, it may miss writes if the file is
-    // closed without flushing first. Hence, we flush once here.
-    match __asyncify_light(env, None, state.fs.flush(fd))? {
-        Ok(_) | Err(Errno::Isdir) | Err(Errno::Io) | Err(Errno::Access) => {}
-        Err(e) => {
-            return Ok(e);
-        }
+
+    if !outcome.removed {
+        return Ok(Errno::Badf);
     }
-    wasi_try_ok!(state.fs.close_fd(fd));
+
+    flush_captured_handle(env, outcome.flush_target)?;
 
     #[cfg(feature = "journal")]
     if env.enable_journal {

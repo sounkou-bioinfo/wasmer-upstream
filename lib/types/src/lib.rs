@@ -17,7 +17,7 @@
     clippy::unicode_not_nfc,
     clippy::use_self
 )]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(all(feature = "std", feature = "core"))]
 compile_error!(
@@ -51,6 +51,7 @@ pub mod lib {
 }
 
 pub mod error;
+mod exception;
 mod features;
 mod indexes;
 mod initializers;
@@ -58,6 +59,7 @@ mod libcalls;
 mod memory;
 mod module;
 mod module_hash;
+mod progress;
 mod serialize;
 mod stack;
 mod store_id;
@@ -81,7 +83,7 @@ pub use crate::features::Features;
 pub use crate::indexes::{
     CustomSectionIndex, DataIndex, ElemIndex, ExportIndex, FunctionIndex, GlobalIndex, ImportIndex,
     LocalFunctionIndex, LocalGlobalIndex, LocalMemoryIndex, LocalTableIndex, LocalTagIndex,
-    MemoryIndex, SignatureIndex, TableIndex, Tag, TagIndex,
+    MemoryIndex, SignatureHash, SignatureIndex, TableIndex, Tag, TagIndex,
 };
 pub use crate::initializers::{
     ArchivedDataInitializerLocation, ArchivedOwnedDataInitializer, DataInitializer,
@@ -90,10 +92,11 @@ pub use crate::initializers::{
 };
 pub use crate::memory::{Memory32, Memory64, MemorySize};
 pub use crate::module::{ExportsIterator, ImportKey, ImportsIterator, ModuleInfo};
-pub use crate::module_hash::{HashAlgorithm, ModuleHash};
+pub use crate::module_hash::ModuleHash;
+pub use crate::progress::{CompilationProgress, CompilationProgressCallback, UserAbort};
 pub use crate::types::{
-    ExportType, ExternType, FunctionType, GlobalInit, GlobalType, ImportType, MemoryType,
-    Mutability, TableType, TagKind, TagType, Type, V128,
+    ExportType, ExternType, FunctionType, GlobalInit, GlobalType, ImportType, InitExpr, InitExprOp,
+    MemoryType, Mutability, TableType, TagKind, TagType, Type, V128,
 };
 pub use crate::units::{
     Bytes, PageCountOutOfRange, Pages, WASM_MAX_PAGES, WASM_MIN_PAGES, WASM_PAGE_SIZE,
@@ -105,11 +108,12 @@ pub use crate::memory::MemoryStyle;
 pub use crate::table::TableStyle;
 pub use serialize::MetadataHeader;
 // TODO: OnCalledAction is needed for asyncify. It will be refactored with https://github.com/wasmerio/wasmer/issues/3451
+pub use crate::exception::CATCH_ALL_TAG_VALUE;
 pub use crate::stack::{FrameInfo, SourceLoc, TrapInformation};
 pub use crate::store_id::StoreId;
 pub use crate::trapcode::{OnCalledAction, TrapCode};
 pub use crate::utils::is_wasm;
-pub use crate::vmoffsets::{TargetSharedSignatureIndex, VMBuiltinFunctionIndex, VMOffsets};
+pub use crate::vmoffsets::{VMBuiltinFunctionIndex, VMOffsets};
 
 /// Offset in bytes from the beginning of the function.
 pub type CodeOffset = u32;

@@ -1,5 +1,5 @@
 //! The WebAssembly possible errors
-use crate::{ExternType, Pages};
+use crate::{ExternType, Pages, progress::UserAbort};
 use std::io;
 use thiserror::Error;
 
@@ -93,12 +93,31 @@ pub enum MemoryError {
         /// Message describing the unsupported operation.
         message: String,
     },
-    /// The memory does not support atomic operations.
-    #[error("The memory does not support atomic operations")]
-    AtomicsNotSupported,
+    /// An atomic operation failed.
+    #[error("Atomic operation failed: {0}")]
+    AtomicOperationFailed(AtomicsError),
     /// A user defined error value, used for error cases not listed above.
     #[error("A user-defined error occurred: {0}")]
     Generic(String),
+}
+
+/// Error that can occur during atomic operations. (notify/wait)
+// Non-exhaustive to allow for future variants without breaking changes!
+#[derive(PartialEq, Eq, Debug, Error, Clone, Copy, Hash)]
+#[non_exhaustive]
+pub enum AtomicsError {
+    /// Atomic operations are not supported by this memory.
+    #[error("The memory does not support atomic operations")]
+    Unimplemented,
+    /// Too many waiters for address.
+    #[error("Too many waiters for address")]
+    TooManyWaiters,
+    /// Atomic operations are disabled.
+    #[error("Atomic operations are disabled for this memory")]
+    AtomicsDisabled,
+    /// The memory was already dropped.
+    #[error("The memory was already dropped")]
+    MemoryDropped,
 }
 
 /// An ImportError.
@@ -147,11 +166,11 @@ use crate::lib::std::string::String;
 #[derive(Debug)]
 #[cfg_attr(feature = "std", derive(Error))]
 pub enum CompileError {
-    /// A Wasm translation error occured.
+    /// A Wasm translation error occurred.
     #[cfg_attr(feature = "std", error("WebAssembly translation error: {0}"))]
     Wasm(WasmError),
 
-    /// A compilation error occured.
+    /// A compilation error occurred.
     #[cfg_attr(feature = "std", error("Compilation error: {0}"))]
     Codegen(String),
 
@@ -178,11 +197,21 @@ pub enum CompileError {
     /// Middleware error occurred.
     #[cfg_attr(feature = "std", error("Middleware error: {0}"))]
     MiddlewareError(String),
+
+    /// Compilation aborted by a user callback.
+    #[cfg_attr(feature = "std", error("Compilation aborted: {0}"))]
+    Aborted(UserAbort),
 }
 
 impl From<WasmError> for CompileError {
     fn from(original: WasmError) -> Self {
         Self::Wasm(original)
+    }
+}
+
+impl From<UserAbort> for CompileError {
+    fn from(abort: UserAbort) -> Self {
+        Self::Aborted(abort)
     }
 }
 
@@ -204,6 +233,12 @@ impl MiddlewareError {
             name: name.into(),
             message: message.into(),
         }
+    }
+}
+
+impl From<MiddlewareError> for CompileError {
+    fn from(error: MiddlewareError) -> Self {
+        WasmError::Middleware(error).into()
     }
 }
 

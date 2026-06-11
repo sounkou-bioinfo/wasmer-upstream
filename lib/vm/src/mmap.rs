@@ -9,11 +9,6 @@ use std::io;
 use std::ptr;
 use std::slice;
 
-/// Round `size` up to the nearest multiple of `page_size`.
-fn round_up_to_page_size(size: usize, page_size: usize) -> usize {
-    (size + (page_size - 1)) & !(page_size - 1)
-}
-
 /// A simple struct consisting of a page-aligned pointer to page-aligned
 /// and initially-zeroed memory and a length.
 #[derive(Debug)]
@@ -57,7 +52,7 @@ impl Mmap {
     /// Create a new `Mmap` pointing to at least `size` bytes of page-aligned accessible memory.
     pub fn with_at_least(size: usize) -> Result<Self, String> {
         let page_size = region::page::size();
-        let rounded_size = round_up_to_page_size(size, page_size);
+        let rounded_size = size.next_multiple_of(page_size);
         Self::accessible_reserved(rounded_size, rounded_size, None, MmapType::Private)
     }
 
@@ -327,7 +322,7 @@ impl Mmap {
     }
 
     /// Return the allocated memory as a mutable slice of u8.
-    pub fn as_mut_slice_arbitary(&mut self, size: usize) -> &mut [u8] {
+    pub fn as_mut_slice_arbitrary(&mut self, size: usize) -> &mut [u8] {
         let size = usize::min(size, self.total_size);
         unsafe { slice::from_raw_parts_mut(self.ptr as *mut u8, size) }
     }
@@ -354,12 +349,12 @@ impl Mmap {
 
     /// Duplicate in a new memory mapping.
     #[deprecated = "use `copy` instead"]
-    pub fn duplicate(&mut self, size_hint: Option<usize>) -> Result<Self, String> {
+    pub fn duplicate(&self, size_hint: Option<usize>) -> Result<Self, String> {
         self.copy(size_hint)
     }
 
     /// Duplicate in a new memory mapping.
-    pub fn copy(&mut self, size_hint: Option<usize>) -> Result<Self, String> {
+    pub fn copy(&self, size_hint: Option<usize>) -> Result<Self, String> {
         // NOTE: accessible_size != used size as the value is not
         //       automatically updated when the pre-provisioned space is used
         let mut copy_size = self.accessible_size;
@@ -369,7 +364,7 @@ impl Mmap {
 
         let mut new =
             Self::accessible_reserved(copy_size, self.total_size, None, MmapType::Private)?;
-        new.as_mut_slice_arbitary(copy_size)
+        new.as_mut_slice_arbitrary(copy_size)
             .copy_from_slice(self.as_slice_arbitary(copy_size));
         Ok(new)
     }
@@ -408,17 +403,4 @@ impl Drop for Mmap {
 fn _assert() {
     fn _assert_send_sync<T: Send + Sync>() {}
     _assert_send_sync::<Mmap>();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_round_up_to_page_size() {
-        assert_eq!(round_up_to_page_size(0, 4096), 0);
-        assert_eq!(round_up_to_page_size(1, 4096), 4096);
-        assert_eq!(round_up_to_page_size(4096, 4096), 4096);
-        assert_eq!(round_up_to_page_size(4097, 4096), 8192);
-    }
 }

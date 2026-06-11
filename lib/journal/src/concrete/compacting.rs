@@ -13,7 +13,7 @@ pub type Fd = u32;
 /// final journal as it is compacted.
 ///
 /// By grouping events into subevents it makes it possible to ignore an
-/// entire subgroup of events which are superseeded by a later event. For
+/// entire subgroup of events which are superseded by a later event. For
 /// example, all the events involved in creating a file are irrelevant if
 /// that file is later deleted.
 #[derive(Debug, Default)]
@@ -61,7 +61,7 @@ impl From<Range<u64>> for MemoryRange {
 /// on the final deterministic outcome of the entire log.
 ///
 /// By grouping events into subevents it makes it possible to ignore an
-/// entire subgroup of events which are superceded by a later event. For
+/// entire subgroup of events which are superseded by a later event. For
 /// example, all the events involved in creating a file are irrelevant if
 /// that file is later deleted.
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
@@ -158,9 +158,9 @@ impl State {
             .tty
             .as_ref()
             .into_iter()
-            .chain(self.chdir.as_ref().into_iter())
-            .chain(self.process_exit.as_ref().into_iter())
-            .chain(self.init_module.as_ref().into_iter())
+            .chain(self.chdir.as_ref())
+            .chain(self.process_exit.as_ref())
+            .chain(self.init_module.as_ref())
             .chain(self.snapshots.iter())
             .chain(self.memory_map.values())
             .chain(self.thread_map.values())
@@ -391,7 +391,7 @@ impl CompactingJournal {
         })
     }
 
-    /// Creates a filter jounral which will write all
+    /// Creates a filter journal which will write all
     /// its events to an inner journal
     pub fn create_filter<J>(
         &self,

@@ -55,12 +55,20 @@ impl Ord for PrettyDuration {
 }
 
 impl JsonSchema for PrettyDuration {
-    fn schema_name() -> String {
-        "PrettyDuration".to_owned()
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("PrettyDuration")
     }
 
-    fn json_schema(r#gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        String::json_schema(r#gen)
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        String::json_schema(generator)
+    }
+
+    fn inline_schema() -> bool {
+        false
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        Self::schema_name()
     }
 }
 
@@ -189,7 +197,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    pub fn cant_parse_nagative_duration() {
+    pub fn cant_parse_negative_duration() {
         _ = "-12s".parse::<PrettyDuration>().unwrap();
     }
 }

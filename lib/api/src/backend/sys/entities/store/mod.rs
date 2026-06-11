@@ -3,7 +3,7 @@ use crate::BackendStore;
 use crate::entities::engine::{AsEngineRef, Engine, EngineRef};
 use wasmer_vm::TrapHandlerFn;
 use wasmer_vm::init_traps;
-pub use wasmer_vm::{StoreHandle, StoreObjects};
+pub use wasmer_vm::{StoreHandle, StoreId, StoreObjects};
 
 mod obj;
 pub use obj::*;
@@ -70,18 +70,6 @@ impl NativeStoreExt for Store {
     }
 }
 
-impl NativeStoreExt for crate::Store {
-    fn set_trap_handler(&mut self, handler: Option<Box<TrapHandlerFn<'static>>>) {
-        self.inner.store.as_sys_mut().set_trap_handler(handler)
-    }
-
-    /// The signal handler
-    #[inline]
-    fn signal_handler(&self) -> Option<*const TrapHandlerFn<'static>> {
-        self.inner.store.as_sys().signal_handler()
-    }
-}
-
 impl crate::BackendStore {
     /// Consume [`self`] into [`crate::backend::sys::store::Store`].
     pub fn into_sys(self) -> crate::backend::sys::store::Store {
@@ -112,24 +100,36 @@ impl crate::BackendStore {
     }
 }
 
-impl crate::Store {
-    /// Consume [`self`] into [`crate::backend::sys::store::Store`].
-    pub(crate) fn into_sys(self) -> crate::backend::sys::store::Store {
-        self.inner.store.into_sys()
+/// Allows embedders to interrupt a running WASM instance.
+#[cfg(all(unix, feature = "experimental-host-interrupt"))]
+#[derive(Clone)]
+pub struct Interrupter {
+    store_id: StoreId,
+}
+
+#[cfg(all(unix, feature = "experimental-host-interrupt"))]
+impl Interrupter {
+    /// Builds a new interrupter.
+    pub fn new(store_id: StoreId) -> Self {
+        Self { store_id }
     }
 
-    /// Convert a reference to [`self`] into a reference [`crate::backend::sys::store::Store`].
-    pub(crate) fn as_sys(&self) -> &crate::backend::sys::store::Store {
-        self.inner.store.as_sys()
-    }
+    /// Interrupts running WASM instances from the owning `Store`.
+    pub fn interrupt(&self) {
+        use wasmer_vm::interrupt_registry;
 
-    /// Convert a mutable reference to [`self`] into a mutable reference [`crate::backend::sys::store::Store`].
-    pub(crate) fn as_sys_mut(&mut self) -> &mut crate::backend::sys::store::Store {
-        self.inner.store.as_sys_mut()
-    }
-
-    /// Return true if [`self`] is a store from the `sys` runtime.
-    pub fn is_sys(&self) -> bool {
-        self.inner.store.is_sys()
+        // Even though `interrupt` reports whether it sent the signal successfully,
+        // there's nothing meaningful embedders can do with the result; a sent
+        // signal may not be processed in rare cases, and none of the error cases
+        // are hard errors in the sense that retrying the interrupt at a later
+        // point is *guaranteed* to fail again. Hence, we don't return any
+        // indication of success or failure to embedder code.
+        if !matches!(
+            interrupt_registry::interrupt(self.store_id),
+            Err(interrupt_registry::InterruptError::StoreNotRunning)
+        ) {
+            #[cfg(feature = "experimental-async")]
+            crate::backend::sys::async_runtime::notify_pending_futures_of_interrupt(self.store_id);
+        }
     }
 }

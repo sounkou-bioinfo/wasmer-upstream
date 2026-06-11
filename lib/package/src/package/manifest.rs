@@ -3,14 +3,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ciborium::{Value, cbor};
+use ciborium::Value;
 use semver::VersionReq;
 use sha2::Digest;
 use shared_buffer::{MmapError, OwnedBuffer};
 use url::Url;
 #[allow(deprecated)]
 use wasmer_config::package::{CommandV1, CommandV2, Manifest as WasmerManifest, Package};
-use wasmer_config::package::{SuggestedCompilerOptimizations, UserAnnotations};
 use webc::{
     indexmap::{self, IndexMap},
     metadata::AtomSignature,
@@ -161,7 +160,7 @@ pub(crate) fn wasmer_manifest_to_webc(
 /// take a `wasmer.toml` manifest and convert it to the `*.webc` equivalent.
 pub(crate) fn in_memory_wasmer_manifest_to_webc(
     manifest: &WasmerManifest,
-    atoms: &BTreeMap<String, (Option<String>, OwnedBuffer, Option<&UserAnnotations>)>,
+    atoms: &BTreeMap<String, (Option<String>, OwnedBuffer)>,
 ) -> Result<(WebcManifest, BTreeMap<String, OwnedBuffer>), ManifestError> {
     let use_map = transform_dependencies(&manifest.dependencies)?;
 
@@ -280,40 +279,27 @@ fn transform_atoms(
             error,
         })?;
 
-        atom_entries.insert(
-            name.clone(),
-            (module.kind.clone(), file, module.annotations.as_ref()),
-        );
+        atom_entries.insert(name.clone(), (module.kind.clone(), file));
     }
 
     transform_atoms_shared(&atom_entries)
 }
 
 fn transform_in_memory_atoms(
-    atoms: &BTreeMap<String, (Option<String>, OwnedBuffer, Option<&UserAnnotations>)>,
+    atoms: &BTreeMap<String, (Option<String>, OwnedBuffer)>,
 ) -> Result<(IndexMap<String, Atom>, Atoms), ManifestError> {
     transform_atoms_shared(atoms)
 }
 
 fn transform_atoms_shared(
-    atoms: &BTreeMap<String, (Option<String>, OwnedBuffer, Option<&UserAnnotations>)>,
+    atoms: &BTreeMap<String, (Option<String>, OwnedBuffer)>,
 ) -> Result<(IndexMap<String, Atom>, Atoms), ManifestError> {
     let mut atom_files = BTreeMap::new();
     let mut metadata = IndexMap::new();
 
-    for (name, (kind, content, misc_annotations)) in atoms.iter() {
+    for (name, (kind, content)) in atoms.iter() {
         // Create atom with annotations including Wasm features if available
         let mut annotations = IndexMap::new();
-        if let Some(misc_annotations) = misc_annotations
-            && let Some(pass_params) = misc_annotations
-                .suggested_compiler_optimizations
-                .pass_params
-        {
-            annotations.insert(
-                SuggestedCompilerOptimizations::KEY.to_string(),
-                cbor!({"pass_params" => pass_params}).unwrap(),
-            );
-        }
 
         // Detect required WebAssembly features by analyzing the module binary
         let features_result = wasmer_types::Features::detect_from_wasm(content);
@@ -526,7 +512,7 @@ fn transform_commands(
     manifest: &WasmerManifest,
     base_dir: &Path,
 ) -> Result<IndexMap<String, Command>, ManifestError> {
-    trasform_commands_shared(
+    transform_commands_shared(
         manifest,
         |cmd| transform_command_v1(cmd, manifest),
         |cmd| transform_command_v2(cmd, base_dir),
@@ -536,7 +522,7 @@ fn transform_commands(
 fn transform_in_memory_commands(
     manifest: &WasmerManifest,
 ) -> Result<IndexMap<String, Command>, ManifestError> {
-    trasform_commands_shared(
+    transform_commands_shared(
         manifest,
         |cmd| transform_command_v1(cmd, manifest),
         transform_in_memory_command_v2,
@@ -544,7 +530,7 @@ fn transform_in_memory_commands(
 }
 
 #[allow(deprecated)]
-fn trasform_commands_shared(
+fn transform_commands_shared(
     manifest: &WasmerManifest,
     transform_command_v1: impl Fn(&CommandV1) -> Result<Command, ManifestError>,
     transform_command_v2: impl Fn(&CommandV2) -> Result<Command, ManifestError>,
@@ -1224,14 +1210,14 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let wasmer_toml = r#"
             [package]
-            name = "sharrattj/bash"
+            name = "wasmer/bash"
             version = "1.0.17"
             description = "Bash is a modern POSIX-compliant implementation of /bin/sh."
             license = "GNU"
             wasmer-extra-flags = "--enable-threads --enable-bulk-memory"
 
             [dependencies]
-            "sharrattj/coreutils" = "1.0.16"
+            "wasmer/coreutils" = "1.0.19"
 
             [[module]]
             name = "bash"

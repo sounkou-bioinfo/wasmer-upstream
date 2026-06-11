@@ -1,21 +1,22 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::PathBuf,
     sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, atomic::AtomicU64},
 };
 
+#[cfg(feature = "enable-serde")]
 use serde_derive::{Deserialize, Serialize};
-use std::sync::Mutex as StdMutex;
-use tokio::sync::{Mutex as AsyncMutex, watch};
 use virtual_fs::{Pipe, PipeRx, PipeTx, VirtualFile};
-use wasmer_wasix_types::wasi::{EpollType, Fd as WasiFd, Fdflags, Fdflagsext, Filestat, Rights};
+use wasmer_wasix_types::wasi::{Fdflags, Fdflagsext, Filestat, Rights};
 
 use crate::net::socket::InodeSocket;
+use crate::os::epoll::EpollState;
 
-use super::{
-    InodeGuard, InodeValFilePollGuard, InodeValFilePollGuardMode, InodeWeakGuard, NotificationInner,
-};
+use super::{InodeGuard, InodeWeakGuard, NotificationInner};
+
+/// Shared handle to an open [`VirtualFile`].
+pub(crate) type VirtualFileLock = Arc<RwLock<Box<dyn VirtualFile + Send + Sync + 'static>>>;
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
@@ -83,63 +84,6 @@ impl InodeVal {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EpollFd {
-    /// The events we are polling on
-    pub events: EpollType,
-    /// Pointer to the user data
-    pub ptr: u64,
-    /// File descriptor we are polling on
-    pub fd: WasiFd,
-    /// Associated user data
-    pub data1: u32,
-    /// Associated user data
-    pub data2: u64,
-}
-
-/// Represents all the EpollInterests that have occurred
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct EpollInterest {
-    /// Using a hash set prevents the same interest from
-    /// being triggered more than once
-    pub interest: HashSet<(WasiFd, EpollType)>,
-}
-
-/// Guard the cleans up the selector registrations
-#[derive(Debug)]
-pub struct EpollJoinGuard {
-    pub(crate) fd_guard: InodeValFilePollGuard,
-}
-impl Drop for EpollJoinGuard {
-    fn drop(&mut self) {
-        match &self.fd_guard.mode {
-            InodeValFilePollGuardMode::File(_) => {
-                // Intentionally ignored, epoll doesn't work with files
-            }
-            InodeValFilePollGuardMode::Socket { inner } => {
-                let mut inner = inner.protected.write().unwrap();
-                inner.remove_handler();
-            }
-            InodeValFilePollGuardMode::EventNotifications(inner) => {
-                inner.remove_interest_handler();
-            }
-            InodeValFilePollGuardMode::DuplexPipe { pipe } => {
-                let inner = pipe.write().unwrap();
-                inner.remove_interest_handler();
-            }
-            InodeValFilePollGuardMode::PipeRx { rx } => {
-                let inner = rx.write().unwrap();
-                inner.remove_interest_handler();
-            }
-            InodeValFilePollGuardMode::PipeTx { .. } => {
-                // Intentionally ignored, the sending end of a pipe can't have an interest handler
-            }
-        }
-    }
-}
-
-pub type EpollSubscriptions = HashMap<WasiFd, (EpollFd, Vec<EpollJoinGuard>)>;
-
 /// The core of the filesystem abstraction.  Includes directories,
 /// files, and symlinks.
 #[derive(Debug)]
@@ -148,14 +92,14 @@ pub enum Kind {
     File {
         /// The open file, if it's open
         #[cfg_attr(feature = "enable-serde", serde(skip))]
-        handle: Option<Arc<RwLock<Box<dyn VirtualFile + Send + Sync + 'static>>>>,
+        handle: Option<VirtualFileLock>,
         /// The path on the host system where the file is located
         /// This is deprecated and will be removed soon
         path: PathBuf,
         /// Marks the file as a special file that only one `fd` can exist for
         /// This is useful when dealing with host-provided special files that
         /// should be looked up by path
-        /// TOOD: clarify here?
+        /// TODO: clarify here?
         fd: Option<u32>,
     },
     #[cfg_attr(feature = "enable-serde", serde(skip))]
@@ -175,14 +119,9 @@ pub enum Kind {
     DuplexPipe {
         pipe: Pipe,
     },
+    #[cfg_attr(feature = "enable-serde", serde(skip))]
     Epoll {
-        // List of events we are polling on
-        subscriptions: Arc<StdMutex<EpollSubscriptions>>,
-        // Notification pipeline for sending events
-        tx: Arc<watch::Sender<EpollInterest>>,
-        // Notification pipeline for events that need to be
-        // checked on the next wait
-        rx: Arc<AsyncMutex<watch::Receiver<EpollInterest>>>,
+        state: Arc<EpollState>,
     },
     Dir {
         /// Parent directory
@@ -200,16 +139,15 @@ pub enum Kind {
     Root {
         entries: HashMap<String, InodeGuard>,
     },
-    /// The first two fields are data _about_ the symlink
-    /// the last field is the data _inside_ the symlink
-    ///
-    /// `base_po_dir` should never be the root because:
-    /// - Right now symlinks are not allowed in the immutable root
-    /// - There is always a closer pre-opened dir to the symlink file (by definition of the root being a collection of preopened dirs)
+    /// The first two fields are data _about_ the symlink; the last field is
+    /// the data _inside_ the symlink.
     Symlink {
-        /// The preopened dir that this symlink file is relative to (via `path_to_symlink`)
-        base_po_dir: WasiFd,
-        /// The path to the symlink from the `base_po_dir`
+        /// Whether the link came from the backing filesystem or from a WASI
+        /// `path_symlink` call. Backing links are resolved within their mount;
+        /// virtual links are resolved from the WASIX virtual root.
+        symlink_kind: SymlinkKind,
+        /// Full path to the symlink from the WASIX virtual root, with no
+        /// leading slash.
         path_to_symlink: PathBuf,
         /// the value of the symlink as a relative path
         relative_path: PathBuf,
@@ -220,4 +158,11 @@ pub enum Kind {
     EventNotifications {
         inner: Arc<NotificationInner>,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub enum SymlinkKind {
+    Backing,
+    Virtual,
 }

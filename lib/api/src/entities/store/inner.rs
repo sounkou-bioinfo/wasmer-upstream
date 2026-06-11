@@ -1,5 +1,5 @@
 use crate::{
-    AsStoreMut,
+    AsStoreMut, AsStoreRef, StoreRef,
     entities::{
         engine::{AsEngineRef, Engine},
         store::{StoreMut, StoreObjects},
@@ -29,6 +29,21 @@ impl std::fmt::Debug for StoreInner {
     }
 }
 
+impl AsStoreRef for StoreInner {
+    fn as_store_ref(&self) -> StoreRef<'_> {
+        StoreRef { inner: self }
+    }
+}
+impl AsStoreMut for StoreInner {
+    fn as_store_mut(&mut self) -> StoreMut<'_> {
+        StoreMut { inner: self }
+    }
+
+    fn objects_mut(&mut self) -> &mut StoreObjects {
+        &mut self.objects
+    }
+}
+
 /// Call handler for a store.
 // TODO: better documentation!
 pub type OnCalledHandler = Box<
@@ -38,7 +53,10 @@ pub type OnCalledHandler = Box<
         -> Result<wasmer_types::OnCalledAction, Box<dyn std::error::Error + Send + Sync>>,
 >;
 
-gen_rt_ty!(Store @derives derive_more::From, Debug; @path store);
+gen_rt_ty! {
+    #[derive(derive_more::From, Debug)]
+    pub BackendStore(entities::store::Store);
+}
 
 impl BackendStore {
     #[inline]

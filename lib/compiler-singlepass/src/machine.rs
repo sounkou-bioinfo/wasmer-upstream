@@ -2,11 +2,16 @@ use crate::{
     common_decl::*,
     location::{Location, Reg},
     machine_arm64::MachineARM64,
+    machine_riscv::MachineRiscv,
     machine_x64::MachineX86_64,
     unwind::UnwindInstructions,
 };
+
 use dynasmrt::{AssemblyOffset, DynamicLabel};
-use std::{collections::BTreeMap, fmt::Debug};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt::Debug,
+};
 use wasmer_compiler::{
     types::{
         address_map::InstructionAddressMap,
@@ -44,6 +49,7 @@ pub trait MaybeImmediate {
     fn is_imm(&self) -> bool {
         self.imm_value().is_some()
     }
+    fn imm_value_scalar(&self) -> Option<i64>;
 }
 
 /// A trap table for a `RunnableModuleInfo`.
@@ -56,8 +62,6 @@ pub struct TrapTable {
 // all machine seems to have a page this size, so not per arch for now
 pub const NATIVE_PAGE_SIZE: usize = 4096;
 
-pub struct MachineStackOffset(pub usize);
-
 #[allow(dead_code)]
 pub enum UnsignedCondition {
     Equal,
@@ -66,6 +70,32 @@ pub enum UnsignedCondition {
     AboveEqual,
     Below,
     BelowEqual,
+}
+
+#[derive(Debug, Clone)]
+pub enum AssemblyComment {
+    FunctionPrologue,
+    InitializeLocals,
+    TrapHandlersTable,
+    RedZone,
+    FunctionBody,
+}
+
+impl std::fmt::Display for AssemblyComment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AssemblyComment::FunctionPrologue => write!(f, "function prologue"),
+            AssemblyComment::InitializeLocals => write!(f, "initialize locals"),
+            AssemblyComment::TrapHandlersTable => write!(f, "trap handlers table"),
+            AssemblyComment::RedZone => write!(f, "red zone"),
+            AssemblyComment::FunctionBody => write!(f, "body"),
+        }
+    }
+}
+
+pub(crate) struct FinalizedAssembly {
+    pub(crate) body: Vec<u8>,
+    pub(crate) assembly_comments: HashMap<usize, AssemblyComment>,
 }
 
 #[allow(unused)]
@@ -88,7 +118,7 @@ pub trait Machine {
     fn get_used_gprs(&self) -> Vec<Self::GPR>;
     /// Get all used SIMD regs
     fn get_used_simd(&self) -> Vec<Self::SIMD>;
-    /// Picks an unused general pupose register and mark it as used
+    /// Picks an unused general purpose register and mark it as used
     fn acquire_temp_gpr(&mut self) -> Option<Self::GPR>;
     /// Releases a temporary GPR.
     fn release_gpr(&mut self, gpr: Self::GPR);
@@ -96,10 +126,10 @@ pub trait Machine {
     fn reserve_unused_temp_gpr(&mut self, gpr: Self::GPR) -> Self::GPR;
     /// reserve a GPR
     fn reserve_gpr(&mut self, gpr: Self::GPR);
-    /// Push used gpr to the stack. Return the bytes taken on the stack
-    fn push_used_gpr(&mut self, grps: &[Self::GPR]) -> Result<usize, CompileError>;
-    /// Pop used gpr to the stack
-    fn pop_used_gpr(&mut self, grps: &[Self::GPR]) -> Result<(), CompileError>;
+    /// Push used gpr to the stack. Return the bytes taken on the stack.
+    fn push_used_gpr(&mut self, gprs: &[Self::GPR]) -> Result<usize, CompileError>;
+    /// Pop used gpr from the stack.
+    fn pop_used_gpr(&mut self, gprs: &[Self::GPR]) -> Result<(), CompileError>;
     /// Picks an unused SIMD register.
     ///
     /// This method does not mark the register as used
@@ -118,7 +148,7 @@ pub trait Machine {
     fn push_used_simd(&mut self, simds: &[Self::SIMD]) -> Result<usize, CompileError>;
     /// Pop used simd regs to the stack
     fn pop_used_simd(&mut self, simds: &[Self::SIMD]) -> Result<(), CompileError>;
-    /// Return a rounded stack adjustement value (must be multiple of 16bytes on ARM64 for example)
+    /// Return a rounded stack adjustment value (must be multiple of 16bytes on ARM64 for example)
     fn round_stack_adjust(&self, value: usize) -> usize;
     /// Set the source location of the Wasm to the given offset.
     fn set_srcloc(&mut self, offset: u32);
@@ -135,7 +165,7 @@ pub trait Machine {
     fn insert_stackoverflow(&mut self);
     /// Get all current TrapInformation
     fn collect_trap_information(&self) -> Vec<TrapInformation>;
-    // Get all intructions address map
+    // Get all instructions address map
     fn instructions_address_map(&self) -> Vec<InstructionAddressMap>;
     /// Memory location for a local on the stack
     /// Like Location::Memory(GPR::RBP, -(self.stack_offset.0 as i32)) for x86_64
@@ -144,7 +174,7 @@ pub trait Machine {
     fn extend_stack(&mut self, delta_stack_offset: u32) -> Result<(), CompileError>;
     /// Truncate stack space by the `delta_stack_offset`.
     fn truncate_stack(&mut self, delta_stack_offset: u32) -> Result<(), CompileError>;
-    /// Zero a location taht is 32bits
+    /// Zero a location that is 32bits
     fn zero_location(
         &mut self,
         size: Size,
@@ -198,12 +228,18 @@ pub trait Machine {
         stack_offset: &mut usize,
         calling_convention: CallingConvention,
     ) -> Location<Self::GPR, Self::SIMD>;
-    /// Get simple param location
+    /// Get param location (idx must point to an argument that is passed in a GPR).
     fn get_simple_param_location(
         &self,
         idx: usize,
         calling_convention: CallingConvention,
-    ) -> Location<Self::GPR, Self::SIMD>;
+    ) -> Self::GPR;
+    /// Adjust GPR param for calling convention ABI purpose.
+    fn adjust_gpr_param_location(
+        &mut self,
+        register: Self::GPR,
+        size: Size,
+    ) -> Result<(), CompileError>;
     /// Get return value location (to build a call, using SP for stack return values).
     fn get_return_value_location(
         &self,
@@ -248,7 +284,10 @@ pub trait Machine {
     ) -> Result<(), CompileError>;
 
     /// Finalize the assembler
-    fn assembler_finalize(self) -> Result<Vec<u8>, CompileError>;
+    fn assembler_finalize(
+        self,
+        assembly_comments: HashMap<usize, AssemblyComment>,
+    ) -> Result<FinalizedAssembly, CompileError>;
 
     /// get_offset of Assembler
     fn get_offset(&self) -> Offset;
@@ -262,9 +301,7 @@ pub trait Machine {
     fn emit_function_epilog(&mut self) -> Result<(), CompileError>;
     /// Handle copy to SIMD register from ret value (if needed by the arch/calling convention)
     fn emit_function_return_float(&mut self) -> Result<(), CompileError>;
-    /// Is NaN canonicalization supported
-    fn arch_supports_canonicalize_nan(&self) -> bool;
-    /// Cannonicalize a NaN (or panic if not supported)
+    /// Canonicalize a NaN (or panic if not supported)
     fn canonicalize_nan(
         &mut self,
         sz: Size,
@@ -279,14 +316,12 @@ pub trait Machine {
     /// emit a label
     fn emit_label(&mut self, label: Label) -> Result<(), CompileError>;
 
-    /// get the gpr use for call. like RAX on x86_64
-    fn get_grp_for_call(&self) -> Self::GPR;
+    /// get the gpr used for call. like RAX on x86_64
+    fn get_gpr_for_call(&self) -> Self::GPR;
     /// Emit a call using the value in register
     fn emit_call_register(&mut self, register: Self::GPR) -> Result<(), CompileError>;
     /// Emit a call to a label
     fn emit_call_label(&mut self, label: Label) -> Result<(), CompileError>;
-    /// Does an trampoline is neededfor indirect call
-    fn arch_requires_indirect_call_trampoline(&self) -> bool;
     /// indirect call with trampoline
     fn arch_emit_indirect_call_with_trampoline(
         &mut self,
@@ -297,10 +332,6 @@ pub trait Machine {
         &mut self,
         location: Location<Self::GPR, Self::SIMD>,
     ) -> Result<(), CompileError>;
-    /// get the gpr for the return of generic values
-    fn get_gpr_for_ret(&self) -> Self::GPR;
-    /// get the simd for the return of float/double values
-    fn get_simd_for_ret(&self) -> Self::SIMD;
 
     /// Emit a debug breakpoint
     fn emit_debug_breakpoint(&mut self) -> Result<(), CompileError>;
@@ -322,7 +353,7 @@ pub trait Machine {
         dest: Location<Self::GPR, Self::SIMD>,
     ) -> Result<(), CompileError>;
 
-    /// jmp without condidtion
+    /// jmp without condition
     fn jmp_unconditional(&mut self, label: Label) -> Result<(), CompileError>;
 
     /// jmp to label if the provided condition is true (when comparing loc_a and loc_b)
@@ -335,7 +366,7 @@ pub trait Machine {
         label: Label,
     ) -> Result<(), CompileError>;
 
-    /// jmp using a jump table at lable with cond as the indice
+    /// jmp using a jump table at label with cond as the indice
     fn emit_jmp_to_jumptable(
         &mut self,
         label: Label,
@@ -542,7 +573,7 @@ pub trait Machine {
         loc: Location<Self::GPR, Self::SIMD>,
         ret: Location<Self::GPR, Self::SIMD>,
     ) -> Result<(), CompileError>;
-    /// Count Trailling 0 bit of an i32
+    /// Count Trailing 0 bit of an i32
     fn i32_ctz(
         &mut self,
         loc: Location<Self::GPR, Self::SIMD>,
@@ -1226,7 +1257,7 @@ pub trait Machine {
         loc: Location<Self::GPR, Self::SIMD>,
         ret: Location<Self::GPR, Self::SIMD>,
     ) -> Result<(), CompileError>;
-    /// Count Trailling 0 bit of an i64
+    /// Count Trailing 0 bit of an i64
     fn i64_ctz(
         &mut self,
         loc: Location<Self::GPR, Self::SIMD>,
@@ -2342,6 +2373,10 @@ pub fn gen_std_trampoline(
             let machine = MachineARM64::new(Some(target.clone()));
             machine.gen_std_trampoline(sig, calling_convention)
         }
+        Architecture::Riscv64(_) => {
+            let machine = MachineRiscv::new(Some(target.clone()), false)?;
+            machine.gen_std_trampoline(sig, calling_convention)
+        }
         _ => Err(CompileError::UnsupportedTarget(
             "singlepass unimplemented arch for gen_std_trampoline".to_owned(),
         )),
@@ -2364,6 +2399,10 @@ pub fn gen_std_dynamic_import_trampoline(
             let machine = MachineARM64::new(Some(target.clone()));
             machine.gen_std_dynamic_import_trampoline(vmoffsets, sig, calling_convention)
         }
+        Architecture::Riscv64(_) => {
+            let machine = MachineRiscv::new(Some(target.clone()), false)?;
+            machine.gen_std_dynamic_import_trampoline(vmoffsets, sig, calling_convention)
+        }
         _ => Err(CompileError::UnsupportedTarget(
             "singlepass unimplemented arch for gen_std_dynamic_import_trampoline".to_owned(),
         )),
@@ -2384,6 +2423,10 @@ pub fn gen_import_call_trampoline(
         }
         Architecture::Aarch64(_) => {
             let machine = MachineARM64::new(Some(target.clone()));
+            machine.gen_import_call_trampoline(vmoffsets, index, sig, calling_convention)
+        }
+        Architecture::Riscv64(_) => {
+            let machine = MachineRiscv::new(Some(target.clone()), false)?;
             machine.gen_import_call_trampoline(vmoffsets, index, sig, calling_convention)
         }
         _ => Err(CompileError::UnsupportedTarget(

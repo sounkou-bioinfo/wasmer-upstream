@@ -35,7 +35,6 @@ pub fn fd_readdir<M: MemorySize>(
     let buf_arr = wasi_try_mem_ok!(buf.slice(&memory, buf_len));
     let bufused_ref = bufused.deref(&memory);
     let working_dir = wasi_try_ok!(state.fs.get_fd(fd));
-    let mut cur_cookie = cookie;
     let mut buf_idx = 0usize;
 
     let entries: Vec<(String, Filetype, u64)> = {
@@ -67,16 +66,17 @@ pub fn fd_readdir<M: MemorySize>(
                         })
                         .collect::<Result<Vec<(String, Filetype, u64)>, _>>()
                 );
-                entry_vec.extend(entries.iter().filter(|(_, inode)| inode.is_preopened).map(
-                    |(name, inode)| {
-                        let stat = inode.stat.read().unwrap();
-                        (
-                            inode.name.read().unwrap().to_string(),
-                            stat.st_filetype,
-                            stat.st_ino,
-                        )
-                    },
-                ));
+                let entry_names: std::collections::HashSet<_> =
+                    entry_vec.iter().map(|(name, _, _)| name.clone()).collect();
+                entry_vec.extend(
+                    entries
+                        .iter()
+                        .filter(|(name, _)| !entry_names.contains(*name))
+                        .map(|(name, inode)| {
+                            let stat = inode.stat.read().unwrap();
+                            (name.clone(), stat.st_filetype, stat.st_ino)
+                        }),
+                );
                 // adding . and .. special folders
                 // TODO: inode
                 entry_vec.push((".".to_string(), Filetype::Directory, 0));
@@ -118,8 +118,9 @@ pub fn fd_readdir<M: MemorySize>(
         }
     };
 
-    for (entry_path_str, wasi_file_type, ino) in entries.iter().skip(cookie as usize) {
-        cur_cookie += 1;
+    for (cur_cookie, (entry_path_str, wasi_file_type, ino)) in
+        (cookie + 1..).zip(entries.iter().skip(cookie as usize))
+    {
         let namlen = entry_path_str.len();
         trace!("returning dirent for {}", entry_path_str);
         let dirent = Dirent {

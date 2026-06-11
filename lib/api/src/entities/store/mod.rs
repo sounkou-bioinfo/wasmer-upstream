@@ -1,17 +1,39 @@
 //! Defines the [`Store`] data type and various useful traits and data types to interact with a
 //! store.
 
+/// Defines the [`AsStoreAsync`] trait and its supporting types.
+#[cfg(feature = "experimental-async")]
+mod async_;
+#[cfg(feature = "experimental-async")]
+pub use async_::*;
+
+/// Defines the [`StoreContext`] type.
+mod context;
+
 /// Defines the [`StoreInner`] data type.
 mod inner;
 
 /// Create temporary handles to engines.
 mod store_ref;
+
+/// Single-threaded async-aware RwLock.
+#[cfg(feature = "experimental-async")]
+mod local_rwlock;
+#[cfg(feature = "experimental-async")]
+pub(crate) use local_rwlock::*;
+
+use std::{
+    boxed::Box,
+    ops::{Deref, DerefMut},
+};
+
 pub use store_ref::*;
 
 mod obj;
 pub use obj::*;
 
 use crate::{AsEngineRef, BackendEngine, Engine, EngineRef};
+pub(crate) use context::*;
 pub(crate) use inner::*;
 use wasmer_types::StoreId;
 
@@ -26,7 +48,7 @@ use wasmer_vm::TrapHandlerFn;
 /// The [`Store`] is tied to the underlying [`Engine`] that is — among many things — used to
 /// compile the Wasm bytes into a valid module artifact.
 ///
-/// For more informations, check out the [related WebAssembly specification]
+/// For more information, check out the [related WebAssembly specification]
 /// [related WebAssembly specification]: <https://webassembly.github.io/spec/core/exec/runtime.html#store>
 pub struct Store {
     pub(crate) inner: Box<StoreInner>,
@@ -42,14 +64,6 @@ impl Store {
             BackendEngine::Sys(_) => {
                 BackendStore::Sys(crate::backend::sys::entities::store::Store::new(engine))
             }
-            #[cfg(feature = "wamr")]
-            BackendEngine::Wamr(_) => {
-                BackendStore::Wamr(crate::backend::wamr::entities::store::Store::new(engine))
-            }
-            #[cfg(feature = "wasmi")]
-            BackendEngine::Wasmi(_) => {
-                BackendStore::Wasmi(crate::backend::wasmi::entities::store::Store::new(engine))
-            }
             #[cfg(feature = "v8")]
             BackendEngine::V8(_) => {
                 BackendStore::V8(crate::backend::v8::entities::store::Store::new(engine))
@@ -57,10 +71,6 @@ impl Store {
             #[cfg(feature = "js")]
             BackendEngine::Js(_) => {
                 BackendStore::Js(crate::backend::js::entities::store::Store::new(engine))
-            }
-            #[cfg(feature = "jsc")]
-            BackendEngine::Jsc(_) => {
-                BackendStore::Jsc(crate::backend::jsc::entities::store::Store::new(engine))
             }
         };
 
@@ -108,6 +118,42 @@ impl Store {
     pub fn id(&self) -> StoreId {
         self.inner.objects.id()
     }
+
+    /// Builds an [`Interrupter`] for this store. Calling [`Interrupter::interrupt`]
+    /// will cause running WASM code to terminate immediately with a
+    /// [`HostInterrupt`](crate::backend::sys::vm::TrapCode::HostInterrupt) trap.
+    ///
+    /// Best effort is made to ensure interrupts are handled. However, there is no
+    /// guarantee; under rare circumstances, it is possible for the interrupt to be
+    /// missed. One such case is when the target thread is about to call WASM code
+    /// but has not yet made the call.
+    ///
+    /// To make sure the code is interrupted, the target thread should notify
+    /// the signalling thread that it has finished running in some way, and
+    /// the signalling thread must wait for that notification and retry the
+    /// interrupt if the notification is not received after some time. Embedders
+    /// are expected to implement this logic.
+    ///
+    /// If an interrupt is delivered while an imported function is running,
+    /// the interrupt will simply be stored and processed only when the
+    /// imported function returns control to WASM code. No effort is made
+    /// to interrupt running imported functions. Embedders are expected to
+    /// implement support for interruption of long-running or blocking
+    /// imported functions separately.
+    #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+    pub fn interrupter(&self) -> Interrupter {
+        self.inner.objects.interrupter()
+    }
+
+    #[cfg(feature = "experimental-async")]
+    /// Transforms this store into a [`StoreAsync`] which can be used
+    /// to invoke [`Function::call_async`](crate::Function::call_async).
+    pub fn into_async(self) -> StoreAsync {
+        StoreAsync {
+            id: self.id(),
+            inner: LocalRwLock::new(self.inner),
+        }
+    }
 }
 
 impl PartialEq for Store {
@@ -115,11 +161,6 @@ impl PartialEq for Store {
         Self::same(self, other)
     }
 }
-
-// This is required to be able to set the trap_handler in the
-// Store.
-unsafe impl Send for Store {}
-unsafe impl Sync for Store {}
 
 impl Default for Store {
     fn default() -> Self {

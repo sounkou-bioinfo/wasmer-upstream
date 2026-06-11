@@ -1,23 +1,33 @@
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
 use anyhow::{Context, Error};
-use futures::future::BoxFuture;
 use tokio::runtime::Handle;
-use virtual_fs::{FileSystem, FsError, OverlayFileSystem, RootFileSystemBuilder, TmpFileSystem};
+use virtual_fs::{
+    ArcFileSystem, ExactMountConflictMode, FileSystem, MountFileSystem, OverlayFileSystem,
+    RootFileSystemBuilder, TmpFileSystem, limiter::DynFsMemoryLimiter,
+};
 use webc::metadata::annotations::Wasi as WasiAnnotation;
 
 use crate::{
     WasiEnvBuilder,
-    bin_factory::BinaryPackage,
+    bin_factory::{BinaryPackage, BinaryPackageMounts},
     capabilities::Capabilities,
+    fs::WasiFsRoot,
     journal::{DynJournal, DynReadableJournal, SnapshotTrigger},
 };
 
 pub const MAPPED_CURRENT_DIR_DEFAULT_PATH: &str = "/home";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExistingMountConflictBehavior {
+    Fail,
+    #[default]
+    Override,
+}
 
 #[derive(Debug, Clone)]
 pub struct MappedCommand {
@@ -45,15 +55,16 @@ pub(crate) struct CommonWasiOptions {
     pub(crate) stop_running_after_snapshot: bool,
     pub(crate) skip_stdio_during_bootstrap: bool,
     pub(crate) current_dir: Option<PathBuf>,
+    pub(crate) existing_mount_conflict_behavior: ExistingMountConflictBehavior,
 }
 
 impl CommonWasiOptions {
     pub(crate) fn prepare_webc_env(
         &self,
         builder: &mut WasiEnvBuilder,
-        container_fs: Option<Arc<dyn FileSystem + Send + Sync>>,
+        container_mounts: Option<&BinaryPackageMounts>,
         wasi: &WasiAnnotation,
-        root_fs: Option<TmpFileSystem>,
+        root_fs: Option<WasiFsRoot>,
     ) -> Result<(), anyhow::Error> {
         if let Some(ref entry_function) = self.entry_function {
             builder.set_entry_function(entry_function);
@@ -65,20 +76,37 @@ impl CommonWasiOptions {
                 .iter()
                 .map(|d| d.guest.as_str())
                 .collect::<Vec<_>>();
-            RootFileSystemBuilder::default().build_ext(&mapped_dirs)
+            WasiFsRoot::from_filesystem(Arc::new(
+                RootFileSystemBuilder::default().build_tmp_ext(&mapped_dirs),
+            ))
         });
-        let fs = prepare_filesystem(root_fs, &self.mounts, container_fs)?;
+        let fs = prepare_filesystem(
+            root_fs
+                .root()
+                .filesystem_at(Path::new("/"))
+                .context("root fs is missing a / mount")?,
+            root_fs.memory_limiter(),
+            &self.mounts,
+            container_mounts,
+            self.existing_mount_conflict_behavior,
+        )?;
 
         // TODO: What's a preopen for '.' supposed to mean anyway? Why do we need it?
         if self.mounts.iter().all(|m| m.guest != ".") {
             // The user hasn't mounted "." to anything, so let's map it to "/"
             let path = builder.get_current_dir().unwrap_or(PathBuf::from("/"));
-            builder.add_map_dir(".", path)?;
+            builder.add_preopen_build(|p| {
+                p.directory(&path)
+                    .alias(".")
+                    .read(true)
+                    .write(true)
+                    .create(true)
+            })?;
         }
 
         builder.add_preopen_dir("/")?;
 
-        builder.set_fs(Box::new(fs));
+        builder.set_fs_root(fs);
 
         for pkg in &self.injected_packages {
             builder.add_webc(pkg.clone());
@@ -149,81 +177,165 @@ impl CommonWasiOptions {
 // type ContainerFs =
 //     OverlayFileSystem<TmpFileSystem, [RelativeOrAbsolutePathHack<Arc<dyn FileSystem>>; 1]>;
 
-fn build_directory_mappings(
-    root_fs: &mut TmpFileSystem,
-    mounted_dirs: &[MountedDirectory],
-) -> Result<(), anyhow::Error> {
-    for dir in mounted_dirs {
-        let MountedDirectory {
-            guest: guest_path,
-            fs,
-        } = dir;
-        let mut guest_path = PathBuf::from(guest_path);
-        tracing::debug!(
-            guest=%guest_path.display(),
-            "Mounting",
-        );
+fn normalized_mount_path(guest_path: &str) -> Result<PathBuf, Error> {
+    let mut guest_path = PathBuf::from(guest_path);
 
-        if guest_path.is_relative() {
-            guest_path = apply_relative_path_mounting_hack(&guest_path);
-        }
+    if guest_path.is_relative() {
+        guest_path = apply_relative_path_mounting_hack(&guest_path);
+    }
 
-        let guest_path = root_fs
-            .canonicalize_unchecked(&guest_path)
-            .with_context(|| {
-                format!(
-                    "Unable to canonicalize guest path '{}'",
-                    guest_path.display()
-                )
-            })?;
-
-        if guest_path == Path::new("/") {
-            root_fs
-                .mount_directory_entries(&guest_path, fs, "/".as_ref())
-                .context("Unable to mount to root")?;
-        } else {
-            if let Some(parent) = guest_path.parent() {
-                create_dir_all(&*root_fs, parent).with_context(|| {
-                    format!("Unable to create the \"{}\" directory", parent.display())
-                })?;
+    let mut normalized = PathBuf::from("/");
+    for component in guest_path.components() {
+        match component {
+            Component::RootDir => normalized = PathBuf::from("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.as_os_str() == "/" {
+                    anyhow::bail!(
+                        "Invalid guest mount path \"{}\": parent traversal escapes the virtual root",
+                        guest_path.display()
+                    );
+                }
+                normalized.pop();
             }
-
-            TmpFileSystem::mount(root_fs, guest_path.clone(), fs, "/".into())
-                .with_context(|| format!("Unable to mount \"{}\"", guest_path.display()))?;
+            Component::Normal(part) => normalized.push(part),
+            Component::Prefix(_) => {
+                anyhow::bail!(
+                    "Invalid guest mount path \"{}\": platform-specific prefixes are not supported",
+                    guest_path.display()
+                );
+            }
         }
     }
 
-    Ok(())
+    Ok(normalized)
 }
 
 fn prepare_filesystem(
-    mut root_fs: TmpFileSystem,
+    base_root: Arc<dyn FileSystem + Send + Sync>,
+    memory_limiter: Option<&DynFsMemoryLimiter>,
     mounted_dirs: &[MountedDirectory],
-    container_fs: Option<Arc<dyn FileSystem + Send + Sync>>,
-) -> Result<Box<dyn FileSystem + Send + Sync>, Error> {
-    if !mounted_dirs.is_empty() {
-        build_directory_mappings(&mut root_fs, mounted_dirs)?;
+    container_mounts: Option<&BinaryPackageMounts>,
+    conflict_behavior: ExistingMountConflictBehavior,
+) -> Result<WasiFsRoot, Error> {
+    let mut root_layers: Vec<Arc<dyn FileSystem + Send + Sync>> = Vec::new();
+    let mount_fs = MountFileSystem::new();
+
+    for MountedDirectory { guest, fs } in mounted_dirs {
+        let guest_path = normalized_mount_path(guest)?;
+        tracing::debug!(guest=%guest_path.display(), "Mounting");
+
+        if guest_path == Path::new("/") {
+            root_layers.push(fs.clone());
+        } else {
+            match conflict_behavior {
+                ExistingMountConflictBehavior::Fail => mount_fs
+                    .mount(&guest_path, fs.clone())
+                    .with_context(|| format!("Unable to mount \"{}\"", guest_path.display()))?,
+                ExistingMountConflictBehavior::Override => mount_fs
+                    .set_mount(&guest_path, fs.clone())
+                    .with_context(|| format!("Unable to mount \"{}\"", guest_path.display()))?,
+            }
+        }
     }
 
-    // HACK(Michael-F-Bryan): The WebcVolumeFileSystem only accepts relative
-    // paths, but our Python executable will try to access its standard library
-    // with relative paths assuming that it is being run from the root
-    // directory (i.e. it does `open("lib/python3.6/io.py")` instead of
-    // `open("/lib/python3.6/io.py")`).
-    // Until the FileSystem trait figures out whether relative paths should be
-    // supported or not, we'll add an adapter that automatically retries
-    // operations using an absolute path if it failed using a relative path.
+    let Some(container) = container_mounts else {
+        let root_mount: Arc<dyn FileSystem + Send + Sync> = if root_layers.is_empty() {
+            base_root
+        } else {
+            Arc::new(OverlayFileSystem::new(
+                ArcFileSystem::new(base_root),
+                root_layers,
+            ))
+        };
+        mount_fs.mount(Path::new("/"), root_mount)?;
 
-    let fs = if let Some(container) = container_fs {
-        let container = RelativeOrAbsolutePathHack(container);
-        let fs = OverlayFileSystem::new(root_fs, [container]);
-        Box::new(fs) as Box<dyn FileSystem + Send + Sync>
-    } else {
-        let fs = RelativeOrAbsolutePathHack(root_fs);
-        Box::new(fs) as Box<dyn FileSystem + Send + Sync>
+        return Ok(
+            WasiFsRoot::from_mount_fs(mount_fs).with_memory_limiter_opt(memory_limiter.cloned())
+        );
     };
 
-    Ok(fs)
+    if let Some(container_root) = &container.root_layer {
+        root_layers.push(writable_package_mount(
+            container_root.clone(),
+            memory_limiter,
+        ));
+    }
+
+    let root_mount: Arc<dyn FileSystem + Send + Sync> = if root_layers.is_empty() {
+        base_root
+    } else {
+        Arc::new(OverlayFileSystem::new(
+            ArcFileSystem::new(base_root),
+            root_layers,
+        ))
+    };
+
+    mount_fs.mount(Path::new("/"), root_mount)?;
+    let import_mode = match conflict_behavior {
+        ExistingMountConflictBehavior::Fail => ExactMountConflictMode::Fail,
+        ExistingMountConflictBehavior::Override => ExactMountConflictMode::KeepExisting,
+    };
+    let mut skipped_subtree: Option<PathBuf> = None;
+    for mount in &container.mounts {
+        if skipped_subtree
+            .as_ref()
+            .is_some_and(|prefix| mount.guest_path.starts_with(prefix))
+        {
+            continue;
+        }
+
+        match import_mode {
+            ExactMountConflictMode::Fail => {
+                mount_fs
+                    .mount_with_source(
+                        &mount.guest_path,
+                        &mount.source_path,
+                        writable_package_mount(mount.fs.clone(), memory_limiter),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Unable to merge container mount \"{}\" into the prepared filesystem",
+                            mount.guest_path.display()
+                        )
+                    })?;
+            }
+            ExactMountConflictMode::KeepExisting => {
+                if mount_fs.filesystem_at(&mount.guest_path).is_some() {
+                    skipped_subtree = Some(mount.guest_path.clone());
+                    continue;
+                }
+
+                mount_fs
+                    .mount_with_source(
+                        &mount.guest_path,
+                        &mount.source_path,
+                        writable_package_mount(mount.fs.clone(), memory_limiter),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Unable to merge container mount \"{}\" into the prepared filesystem",
+                            mount.guest_path.display()
+                        )
+                    })?;
+            }
+            ExactMountConflictMode::ReplaceExisting => unreachable!("not used here"),
+        }
+    }
+
+    Ok(WasiFsRoot::from_mount_fs(mount_fs).with_memory_limiter_opt(memory_limiter.cloned()))
+}
+
+fn writable_package_mount(
+    fs: Arc<dyn FileSystem + Send + Sync>,
+    memory_limiter: Option<&DynFsMemoryLimiter>,
+) -> Arc<dyn FileSystem + Send + Sync> {
+    let upper = TmpFileSystem::new();
+    if let Some(memory_limiter) = memory_limiter {
+        upper.set_memory_limiter(memory_limiter.clone());
+    }
+
+    Arc::new(OverlayFileSystem::new(upper, [ArcFileSystem::new(fs)]))
 }
 
 /// HACK: We need this so users can mount host directories at relative paths.
@@ -254,20 +366,6 @@ fn apply_relative_path_mounting_hack(original: &Path) -> PathBuf {
     );
 
     mapped_path
-}
-
-fn create_dir_all(fs: &dyn FileSystem, path: &Path) -> Result<(), Error> {
-    if fs.metadata(path).is_ok() {
-        return Ok(());
-    }
-
-    if let Some(parent) = path.parent() {
-        create_dir_all(fs, parent)?;
-    }
-
-    fs.create_dir(path)?;
-
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -309,104 +407,63 @@ impl From<MappedDirectory> for MountedDirectory {
     }
 }
 
-#[derive(Debug)]
-struct RelativeOrAbsolutePathHack<F>(F);
-
-impl<F: FileSystem> RelativeOrAbsolutePathHack<F> {
-    fn execute<Func, Ret>(&self, path: &Path, operation: Func) -> Result<Ret, FsError>
-    where
-        Func: Fn(&F, &Path) -> Result<Ret, FsError>,
-    {
-        // First, try it with the path we were given
-        let result = operation(&self.0, path);
-
-        if result.is_err() && !path.is_absolute() {
-            // we were given a relative path, but maybe the operation will work
-            // using absolute paths instead.
-            let path = Path::new("/").join(path);
-            operation(&self.0, &path)
-        } else {
-            result
-        }
-    }
-}
-
-impl<F: FileSystem> virtual_fs::FileSystem for RelativeOrAbsolutePathHack<F> {
-    fn readlink(&self, path: &Path) -> virtual_fs::Result<PathBuf> {
-        self.execute(path, |fs, p| fs.readlink(p))
-    }
-
-    fn read_dir(&self, path: &Path) -> virtual_fs::Result<virtual_fs::ReadDir> {
-        self.execute(path, |fs, p| fs.read_dir(p))
-    }
-
-    fn create_dir(&self, path: &Path) -> virtual_fs::Result<()> {
-        self.execute(path, |fs, p| fs.create_dir(p))
-    }
-
-    fn remove_dir(&self, path: &Path) -> virtual_fs::Result<()> {
-        self.execute(path, |fs, p| fs.remove_dir(p))
-    }
-
-    fn rename<'a>(&'a self, from: &Path, to: &Path) -> BoxFuture<'a, virtual_fs::Result<()>> {
-        let from = from.to_owned();
-        let to = to.to_owned();
-        Box::pin(async move { self.0.rename(&from, &to).await })
-    }
-
-    fn metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
-        self.execute(path, |fs, p| fs.metadata(p))
-    }
-
-    fn symlink_metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
-        self.execute(path, |fs, p| fs.symlink_metadata(p))
-    }
-
-    fn remove_file(&self, path: &Path) -> virtual_fs::Result<()> {
-        self.execute(path, |fs, p| fs.remove_file(p))
-    }
-
-    fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {
-        virtual_fs::OpenOptions::new(self)
-    }
-
-    fn mount(
-        &self,
-        name: String,
-        path: &Path,
-        fs: Box<dyn FileSystem + Send + Sync>,
-    ) -> virtual_fs::Result<()> {
-        let name_ref = &name;
-        let f_ref = &Arc::new(fs);
-        self.execute(path, move |f, p| {
-            f.mount(name_ref.clone(), p, Box::new(f_ref.clone()))
-        })
-    }
-}
-
-impl<F: FileSystem> virtual_fs::FileOpener for RelativeOrAbsolutePathHack<F> {
-    fn open(
-        &self,
-        path: &Path,
-        conf: &virtual_fs::OpenOptionsConfig,
-    ) -> virtual_fs::Result<Box<dyn virtual_fs::VirtualFile + Send + Sync + 'static>> {
-        self.execute(path, |fs, p| {
-            fs.new_open_options().options(conf.clone()).open(p)
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::time::SystemTime;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::SystemTime,
+    };
 
     use tempfile::TempDir;
-    use virtual_fs::{DirEntry, FileType, Metadata, WebcVolumeFileSystem};
-    use wasmer_package::utils::from_bytes;
+    use virtual_fs::TmpFileSystem;
+    use virtual_fs::{DirEntry, FileType, FsError, Metadata, limiter::FsMemoryLimiter};
 
     use super::*;
 
-    const PYTHON: &[u8] = include_bytes!("../../../c-api/examples/assets/python-0.1.0.wasmer");
+    fn base_root(root_fs: &MountFileSystem) -> Arc<dyn FileSystem + Send + Sync> {
+        root_fs.filesystem_at(Path::new("/")).unwrap()
+    }
+
+    fn package_mounts(fs: MountFileSystem) -> BinaryPackageMounts {
+        BinaryPackageMounts::from_mount_fs(fs)
+    }
+
+    const PYTHON: &[u8] =
+        include_bytes!("../../../../wasmer-test-files/examples/python-0.1.0.wasmer");
+
+    #[derive(Debug)]
+    struct CountingLimiter {
+        used: AtomicUsize,
+        limit: usize,
+    }
+
+    impl CountingLimiter {
+        fn new(limit: usize) -> Self {
+            Self {
+                used: AtomicUsize::new(0),
+                limit,
+            }
+        }
+    }
+
+    impl FsMemoryLimiter for CountingLimiter {
+        fn on_grow(&self, grown_bytes: usize) -> Result<(), FsError> {
+            let new_total = self.used.fetch_add(grown_bytes, Ordering::SeqCst) + grown_bytes;
+            if new_total > self.limit {
+                self.used.fetch_sub(grown_bytes, Ordering::SeqCst);
+                return Err(FsError::StorageFull);
+            }
+
+            Ok(())
+        }
+
+        fn on_shrink(&self, shrunk_bytes: usize) {
+            self.used.fetch_sub(shrunk_bytes, Ordering::SeqCst);
+        }
+    }
 
     /// Fixes <https://github.com/wasmerio/wasmer/issues/3789>
     #[tokio::test]
@@ -416,7 +473,6 @@ mod tests {
             ..Default::default()
         };
         let mut builder = WasiEnvBuilder::new("program-name");
-        let fs = Arc::new(virtual_fs::EmptyFileSystem::default());
         let mut annotations = WasiAnnotation::new("some-atom");
         annotations.main_args = Some(vec![
             "hard".to_string(),
@@ -424,7 +480,7 @@ mod tests {
             "args".to_string(),
         ]);
 
-        args.prepare_webc_env(&mut builder, Some(fs), &annotations, None)
+        args.prepare_webc_env(&mut builder, None, &annotations, None)
             .unwrap();
 
         assert_eq!(
@@ -452,11 +508,10 @@ mod tests {
             ..Default::default()
         };
         let mut builder = WasiEnvBuilder::new("python");
-        let fs = Arc::new(virtual_fs::EmptyFileSystem::default());
         let mut annotations = WasiAnnotation::new("python");
         annotations.env = Some(vec!["HARD_CODED=env-vars".to_string()]);
 
-        args.prepare_webc_env(&mut builder, Some(fs), &annotations, None)
+        args.prepare_webc_env(&mut builder, None, &annotations, None)
             .unwrap();
 
         assert_eq!(
@@ -466,6 +521,11 @@ mod tests {
                 ("EXTRA".to_string(), b"envs".to_vec()),
             ]
         );
+    }
+
+    fn unix_timestamp_nanos(instant: SystemTime) -> Option<u64> {
+        let duration = instant.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+        Some(duration.as_nanos() as u64)
     }
 
     #[tokio::test]
@@ -479,12 +539,22 @@ mod tests {
             guest: "/home".to_string(),
             host: sub_dir,
         })];
-        let container = from_bytes(PYTHON).unwrap();
-        let webc_fs = WebcVolumeFileSystem::mount_all(&container);
+        let container = wasmer_package::utils::from_bytes(PYTHON).unwrap();
+        let webc_fs = virtual_fs::WebcVolumeFileSystem::mount_all(&container);
+        let mount_fs = MountFileSystem::new();
+        mount_fs.mount(Path::new("/"), Arc::new(webc_fs)).unwrap();
 
         let root_fs = RootFileSystemBuilder::default().build();
-        let fs = prepare_filesystem(root_fs, &mapping, Some(Arc::new(webc_fs))).unwrap();
+        let fs = prepare_filesystem(
+            base_root(&root_fs),
+            None,
+            &mapping,
+            Some(&package_mounts(mount_fs)),
+            ExistingMountConflictBehavior::Override,
+        )
+        .unwrap();
 
+        use virtual_fs::FileSystem;
         assert!(fs.metadata("/home/file.txt".as_ref()).unwrap().is_file());
         assert!(fs.metadata("lib".as_ref()).unwrap().is_dir());
         assert!(
@@ -499,9 +569,291 @@ mod tests {
         );
     }
 
-    fn unix_timestamp_nanos(instant: SystemTime) -> Option<u64> {
-        let duration = instant.duration_since(SystemTime::UNIX_EPOCH).ok()?;
-        Some(duration.as_nanos() as u64)
+    #[tokio::test]
+    async fn package_mount_paths_remain_writable() {
+        use virtual_fs::FileSystem;
+
+        let container = wasmer_package::utils::from_bytes(PYTHON).unwrap();
+        let pkg_mount = virtual_fs::WebcVolumeFileSystem::mount_all(&container);
+
+        let mount_fs = MountFileSystem::new();
+        mount_fs
+            .mount(Path::new("/python"), Arc::new(pkg_mount))
+            .unwrap();
+
+        let root_fs = RootFileSystemBuilder::default().build();
+        let fs = prepare_filesystem(
+            base_root(&root_fs),
+            None,
+            &[],
+            Some(&package_mounts(mount_fs)),
+            ExistingMountConflictBehavior::Override,
+        )
+        .unwrap();
+
+        fs.create_dir(Path::new("/python/custom")).unwrap();
+        fs.new_open_options()
+            .create(true)
+            .write(true)
+            .open(Path::new("/python/custom/sitecustomize.py"))
+            .unwrap();
+
+        assert!(
+            fs.metadata(Path::new("/python/custom/sitecustomize.py"))
+                .unwrap()
+                .is_file()
+        );
+        assert!(
+            fs.metadata(Path::new("/python/lib/python3.6/collections/__init__.py"))
+                .unwrap()
+                .is_file()
+        );
+    }
+
+    #[tokio::test]
+    async fn package_mount_symlinks_remain_writable() {
+        use virtual_fs::FileSystem;
+
+        let container = wasmer_package::utils::from_bytes(PYTHON).unwrap();
+        let pkg_mount = virtual_fs::WebcVolumeFileSystem::mount_all(&container);
+
+        let mount_fs = MountFileSystem::new();
+        mount_fs
+            .mount(Path::new("/python"), Arc::new(pkg_mount))
+            .unwrap();
+
+        let root_fs = RootFileSystemBuilder::default().build();
+        let fs = prepare_filesystem(
+            base_root(&root_fs),
+            None,
+            &[],
+            Some(&package_mounts(mount_fs)),
+            ExistingMountConflictBehavior::Override,
+        )
+        .unwrap();
+
+        fs.create_symlink(
+            Path::new("lib/python3.6/collections"),
+            Path::new("/python/collections-link"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs.readlink(Path::new("/python/collections-link")).unwrap(),
+            Path::new("lib/python3.6/collections")
+        );
+        assert!(
+            fs.symlink_metadata(Path::new("/python/collections-link"))
+                .unwrap()
+                .ft
+                .is_symlink()
+        );
+    }
+
+    #[tokio::test]
+    async fn user_mounts_override_package_mounts_when_configured() {
+        use virtual_fs::FileSystem;
+
+        let user_mount = TmpFileSystem::new();
+        user_mount
+            .new_open_options()
+            .create(true)
+            .write(true)
+            .open(Path::new("/user.txt"))
+            .unwrap();
+
+        let package_mount = TmpFileSystem::new();
+        package_mount
+            .new_open_options()
+            .create(true)
+            .write(true)
+            .open(Path::new("/pkg.txt"))
+            .unwrap();
+
+        let mounted_dirs = [MountedDirectory {
+            guest: "/python".to_string(),
+            fs: Arc::new(user_mount),
+        }];
+
+        let container_mounts = MountFileSystem::new();
+        container_mounts
+            .mount(Path::new("/python"), Arc::new(package_mount))
+            .unwrap();
+
+        let root_fs = RootFileSystemBuilder::default().build();
+        let fs = prepare_filesystem(
+            base_root(&root_fs),
+            None,
+            &mounted_dirs,
+            Some(&package_mounts(container_mounts)),
+            ExistingMountConflictBehavior::Override,
+        )
+        .unwrap();
+
+        assert!(
+            fs.metadata(Path::new("/python/user.txt"))
+                .unwrap()
+                .is_file()
+        );
+        assert_eq!(
+            fs.metadata(Path::new("/python/pkg.txt")),
+            Err(virtual_fs::FsError::EntryNotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_mounts_fail_when_configured() {
+        let user_mount = TmpFileSystem::new();
+        let package_mount = TmpFileSystem::new();
+
+        let mounted_dirs = [MountedDirectory {
+            guest: "/python".to_string(),
+            fs: Arc::new(user_mount),
+        }];
+
+        let container_mounts = MountFileSystem::new();
+        container_mounts
+            .mount(Path::new("/python"), Arc::new(package_mount))
+            .unwrap();
+
+        let root_fs = RootFileSystemBuilder::default().build();
+        let error = prepare_filesystem(
+            base_root(&root_fs),
+            None,
+            &mounted_dirs,
+            Some(&package_mounts(container_mounts)),
+            ExistingMountConflictBehavior::Fail,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Unable to merge container mount \"/python\""),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_mounts_are_composed_even_in_fail_mode() {
+        use virtual_fs::FileSystem;
+
+        let root_mount = TmpFileSystem::new();
+        root_mount
+            .new_open_options()
+            .create(true)
+            .write(true)
+            .open(Path::new("/user.txt"))
+            .unwrap();
+
+        let mounted_dirs = [MountedDirectory {
+            guest: "/".to_string(),
+            fs: Arc::new(root_mount),
+        }];
+
+        let container_mounts = MountFileSystem::new();
+        let container_root = TmpFileSystem::new();
+        container_root
+            .new_open_options()
+            .create(true)
+            .write(true)
+            .open(Path::new("/pkg.txt"))
+            .unwrap();
+        container_mounts
+            .mount(Path::new("/"), Arc::new(container_root))
+            .unwrap();
+
+        let root_fs = RootFileSystemBuilder::default().build();
+        let fs = prepare_filesystem(
+            base_root(&root_fs),
+            None,
+            &mounted_dirs,
+            Some(&package_mounts(container_mounts)),
+            ExistingMountConflictBehavior::Fail,
+        )
+        .unwrap();
+
+        assert!(fs.metadata(Path::new("/user.txt")).unwrap().is_file());
+        assert!(fs.metadata(Path::new("/pkg.txt")).unwrap().is_file());
+    }
+
+    #[tokio::test]
+    async fn multiple_root_mounts_are_composed() {
+        use virtual_fs::FileSystem;
+
+        let first_root = TmpFileSystem::new();
+        first_root
+            .new_open_options()
+            .create(true)
+            .write(true)
+            .open(Path::new("/first.txt"))
+            .unwrap();
+
+        let second_root = TmpFileSystem::new();
+        second_root
+            .new_open_options()
+            .create(true)
+            .write(true)
+            .open(Path::new("/second.txt"))
+            .unwrap();
+
+        let mounted_dirs = [
+            MountedDirectory {
+                guest: "/".to_string(),
+                fs: Arc::new(first_root),
+            },
+            MountedDirectory {
+                guest: "/".to_string(),
+                fs: Arc::new(second_root),
+            },
+        ];
+
+        let root_fs = RootFileSystemBuilder::default().build();
+        let fs = prepare_filesystem(
+            base_root(&root_fs),
+            None,
+            &mounted_dirs,
+            None,
+            ExistingMountConflictBehavior::Fail,
+        )
+        .unwrap();
+
+        assert!(fs.metadata(Path::new("/first.txt")).unwrap().is_file());
+        assert!(fs.metadata(Path::new("/second.txt")).unwrap().is_file());
+    }
+
+    #[tokio::test]
+    async fn prepared_filesystem_preserves_root_memory_limiter() {
+        let limiter: virtual_fs::limiter::DynFsMemoryLimiter = Arc::new(CountingLimiter::new(1));
+
+        let package_mount = TmpFileSystem::new();
+        let container_mounts = MountFileSystem::new();
+        container_mounts
+            .mount(Path::new("/python"), Arc::new(package_mount))
+            .unwrap();
+
+        let root_fs = RootFileSystemBuilder::default().build();
+        let fs = prepare_filesystem(
+            base_root(&root_fs),
+            Some(&limiter),
+            &[],
+            Some(&package_mounts(container_mounts)),
+            ExistingMountConflictBehavior::Override,
+        )
+        .unwrap();
+
+        assert!(fs.memory_limiter().is_some());
+    }
+
+    #[test]
+    fn invalid_guest_mount_paths_are_rejected() {
+        let error = normalized_mount_path("../../python").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("parent traversal escapes the virtual root"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]

@@ -26,7 +26,7 @@ pub struct Global {
 unsafe impl Send for Global {}
 unsafe impl Sync for Global {}
 
-// Global can't be Send in js because it dosen't support `structuredClone`
+// Global can't be Send in js because it doesn't support `structuredClone`
 // https://developer.mozilla.org/en-US/docs/Web/API/structuredClone
 // unsafe impl Send for Global {}
 
@@ -116,7 +116,7 @@ impl Global {
     pub(crate) fn from_vm_extern(store: &mut impl AsStoreMut, vm_global: VMExternGlobal) -> Self {
         check_isolate(store);
         Self {
-            handle: vm_global.into_v8(),
+            handle: vm_global.unwrap_v_8(),
         }
     }
 

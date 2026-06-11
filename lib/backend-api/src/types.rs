@@ -584,6 +584,7 @@ mod queries {
         pub filename: Option<&'a str>,
         pub name: Option<&'a str>,
         pub version: Option<&'a str>,
+        pub method: Option<&'a str>,
     }
 
     #[derive(cynic::QueryFragment, Debug)]
@@ -592,7 +593,7 @@ mod queries {
         variables = "GetSignedUrlForPackageUploadVariables"
     )]
     pub struct GetSignedUrlForPackageUpload {
-        #[arguments(name: $name, version: $version, filename: $filename, expiresAfterSeconds: $expires_after_seconds)]
+        #[arguments(name: $name, version: $version, filename: $filename, expiresAfterSeconds: $expires_after_seconds, method: $method)]
         pub get_signed_url_for_package_upload: Option<SignedUrl>,
     }
 
@@ -607,12 +608,13 @@ mod queries {
         pub filename: &'a str,
         pub name: Option<&'a str>,
         pub version: Option<&'a str>,
+        pub method: Option<&'a str>,
     }
 
     #[derive(cynic::QueryFragment, Debug)]
     #[cynic(graphql_type = "Mutation", variables = "GenerateUploadUrlVariables")]
     pub struct GenerateUploadUrl {
-        #[arguments(input: { expiresAfterSeconds: $expires_after_seconds, filename: $filename, name: $name, version: $version })]
+        #[arguments(input: { expiresAfterSeconds: $expires_after_seconds, filename: $filename, name: $name, version: $version, method: $method })]
         pub generate_upload_url: Option<GenerateUploadUrlPayload>,
     }
 
@@ -620,6 +622,7 @@ mod queries {
     pub struct GenerateUploadUrlPayload {
         #[cynic(rename = "signedUrl")]
         pub signed_url: SignedUrl,
+        pub method: String,
     }
 
     #[derive(cynic::QueryFragment, Debug)]
@@ -1023,6 +1026,18 @@ mod queries {
         pub deleted: bool,
         pub aliases: AppAliasConnection,
         pub s3_url: Option<Url>,
+        pub will_perish_at: Option<DateTime>,
+        pub perish_reason: Option<DeployDeployAppPerishReasonChoices>,
+    }
+
+    #[derive(cynic::Enum, Clone, Copy, Debug)]
+    pub enum DeployDeployAppPerishReasonChoices {
+        #[cynic(rename = "USER_PENDING_VERIFICATION")]
+        UserPendingVerification,
+        #[cynic(rename = "USER_REQUESTED")]
+        UserRequested,
+        #[cynic(rename = "APP_UNCLAIMED")]
+        AppUnclaimed,
     }
 
     #[derive(cynic::QueryFragment, Serialize, Debug, Clone)]
@@ -1328,7 +1343,7 @@ mod queries {
     pub enum StatusEnum {
         Success,
         Working,
-        Failure,
+        Failed,
         Queued,
         Timeout,
         InternalError,
@@ -1341,7 +1356,7 @@ mod queries {
             match self {
                 Self::Success => "success",
                 Self::Working => "working",
-                Self::Failure => "failure",
+                Self::Failed => "failed",
                 Self::Queued => "queued",
                 Self::Timeout => "timeout",
                 Self::InternalError => "internal_error",
@@ -1373,8 +1388,9 @@ mod queries {
 
     #[derive(cynic::QueryFragment, Debug, Clone, Serialize)]
     pub struct BuildConfig {
-        pub build_cmd: String,
-        pub install_cmd: String,
+        pub build_cmd: Option<String>,
+        pub install_cmd: Option<String>,
+        pub start_cmd: Option<String>,
         pub setup_db: bool,
         pub preset_name: String,
         pub app_name: String,
